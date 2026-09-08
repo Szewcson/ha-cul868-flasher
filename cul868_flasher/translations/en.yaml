@@ -1,0 +1,22 @@
+---
+configuration:
+  device:
+    name: CUL868 serial device
+    description: >-
+      The normal CUL868 V3 CDC serial device. Select the CUL application
+      device, not a DFU bootloader node.
+  baudrate:
+    name: Baudrate
+    description: >-
+      The serial speed used for the CUL V command and bootloader request.
+      CULFW defaults to 9600 baud.
+  boot_timeout:
+    name: USB re-enumeration timeout
+    description: >-
+      Seconds to wait for the same physical CUL USB port to change between
+      the CUL application and its ATmega32U4 DFU bootloader.
+  qemu_usb_reenumeration_workaround:
+    name: QEMU USB re-enumeration workaround
+    description: >-
+      Add an 8-second settle delay after each USB personality change. Enable
+      this only when direct USB passthrough in a QEMU guest is unreliable.

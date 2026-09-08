@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light">
+    <title>CUL868 Flasher</title>
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <main>
+      <header class="masthead">
+        <p class="eyebrow">Manual firmware maintenance</p>
+        <h1>CUL868<br><em>Flasher</em></h1>
+        <p class="lede">A guarded, one-device workflow for CUL868 V3 firmware.</p>
+      </header>
+
+      <section class="device-card" aria-labelledby="device-heading">
+        <div>
+          <p class="eyebrow">USB target</p>
+          <h2 id="device-heading" data-device-state>Checking device state</h2>
+          <p data-device-message>Inspecting the configured serial endpoint.</p>
+        </div>
+        <dl>
+          <div><dt>USB path</dt><dd data-topology>Unknown</dd></div>
+          <div><dt>Last verified</dt><dd data-version>Unknown</dd></div>
+        </dl>
+      </section>
+
+      <section class="flash-card" aria-labelledby="flash-heading">
+        <div class="section-heading">
+          <p class="eyebrow">Step 1</p>
+          <h2 id="flash-heading">Validate a firmware file</h2>
+          <p>Choose an Intel HEX file you trust. It stays private to this add-on and is deleted after use.</p>
+        </div>
+        <label class="file-picker">
+          <span>Firmware .hex</span>
+          <input type="file" accept=".hex,text/plain,application/octet-stream" data-upload>
+        </label>
+        <button type="button" class="secondary" data-validate disabled>Validate firmware</button>
+        <div class="notice" hidden data-validation></div>
+
+        <div class="confirmation" hidden data-confirmation>
+          <p class="eyebrow">Step 2</p>
+          <h3>Confirm this flash</h3>
+          <p data-preflight></p>
+          <label class="checkbox">
+            <input type="checkbox" data-confirm>
+            <span>I understand this overwrites the CUL868 application firmware.</span>
+          </label>
+          <button type="button" class="danger" data-flash disabled>Flash CUL868 V3</button>
+        </div>
+      </section>
+
+      <section class="operation-card" aria-live="polite" aria-labelledby="operation-heading">
+        <div class="section-heading">
+          <p class="eyebrow">Operation</p>
+          <h2 id="operation-heading" data-operation-title>Ready</h2>
+          <p data-operation-message>No flash operation is running.</p>
+        </div>
+        <div class="progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+          <span data-progress></span>
+        </div>
+        <p class="error" hidden data-operation-error></p>
+      </section>
+
+      <aside>
+        <strong>Scope:</strong> CUL868 V3 only. This add-on does not download, build, or automatically update firmware.
+      </aside>
+    </main>
+    <script src="app.js"></script>
+  </body>
+</html>

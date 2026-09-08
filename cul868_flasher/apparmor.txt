@@ -1,0 +1,97 @@
+#include <tunables/global>
+
+profile cul868_flasher flags=(attach_disconnected,mediate_deleted) {
+  #include <abstractions/base>
+
+  # The launcher starts S6 and Python; the Python child gets the narrower
+  # runtime policy below. No capabilities are granted to either profile.
+  network inet stream,
+  network inet dgram,
+  network inet6 stream,
+  network inet6 dgram,
+  signal,
+  file,
+
+  /init rix,
+  /run.sh rix,
+  /bin/** ix,
+  /usr/bin/** ix,
+  /etc/s6/** rix,
+  /run/s6/** rwix,
+  /etc/services.d/** rwix,
+  /etc/cont-init.d/** rwix,
+  /etc/cont-finish.d/** rwix,
+  /run/** rwk,
+  /package/** ix,
+  /command/** ix,
+  /usr/lib/bashio/** ix,
+  /tmp/** rwk,
+  /data/ rwk,
+  /data/** rwk,
+
+  /usr/bin/python3 cx -> cul868_flasher_python,
+  /usr/bin/python3.14 cx -> cul868_flasher_python,
+
+  profile cul868_flasher_python flags=(attach_disconnected,mediate_deleted) {
+    # Home Assistant Ingress and the Supervisor lifecycle API need normal
+    # network sockets. The child DFU tool receives no network permission.
+    #include <abstractions/base>
+
+    network inet stream,
+    network inet dgram,
+    network inet6 stream,
+    network inet6 dgram,
+    signal,
+
+    /usr/bin/python3 mr,
+    /usr/bin/python3.14 mr,
+    /usr/lib/** mr,
+    /lib/** mr,
+    /usr/share/** r,
+    /etc/** r,
+    /proc/** r,
+    /run/** r,
+    / r,
+    /app/ r,
+    /app/** r,
+    /data/ rwk,
+    /data/** rwk,
+    /tmp/** rwk,
+    /dev/null rw,
+    /dev/random r,
+    /dev/urandom r,
+    /dev/serial/by-id/** rwk,
+    /dev/ttyACM* rwk,
+    /dev/ttyUSB* rwk,
+    /sys/ r,
+    /sys/class/ r,
+    /sys/class/tty/ r,
+    /sys/class/tty/** r,
+    /sys/bus/ r,
+    /sys/bus/usb/ r,
+    /sys/bus/usb/devices/ r,
+    /sys/bus/usb/devices/** r,
+    /sys/devices/ r,
+    /sys/devices/** r,
+
+    # dfu-programmer only receives raw USB access after Python has matched the
+    # exact physical topology and current bus/device address.
+    /usr/local/bin/dfu-programmer cx -> cul868_flasher_dfu_programmer,
+
+    profile cul868_flasher_dfu_programmer flags=(attach_disconnected,mediate_deleted) {
+      #include <abstractions/base>
+
+      signal,
+      /usr/local/bin/dfu-programmer mr,
+      /usr/lib/** mr,
+      /lib/** mr,
+      /etc/** r,
+      /proc/** r,
+      /tmp/cul868-*.hex r,
+      /dev/null rw,
+      /dev/bus/usb/ r,
+      /dev/bus/usb/*/ rw,
+      /dev/bus/usb/*/* rw,
+    }
+  }
+}

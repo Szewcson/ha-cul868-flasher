@@ -1,0 +1,39 @@
+name: CUL868 Firmware Flasher
+version: 0.1.1
+slug: cul868_flasher
+description: Manually flash CUL868 V3 firmware through its USB DFU bootloader
+stage: experimental
+url: https://github.com/Szewcson/ha-cul868-flasher
+arch:
+  - aarch64
+  - amd64
+startup: services
+init: false
+hassio_api: true
+hassio_role: manager
+ingress: true
+ingress_port: 8099
+# Uploads are bounded and Home Assistant Ingress is request/response based.
+ingress_stream: false
+panel_icon: mdi:radio-tower
+panel_title: CUL868 Flasher
+panel_admin: true
+apparmor: true
+# The normal CUL firmware is a CDC ACM device. dfu-programmer needs raw USB
+# access only while the same device is in its Atmel-compatible DFU personality.
+uart: true
+usb: true
+udev: true
+tmpfs: true
+options:
+  device: null
+  baudrate: "9600"
+  boot_timeout: 45
+  qemu_usb_reenumeration_workaround: false
+schema:
+  # This is the normal CUL868 CDC endpoint, not a bootloader node.
+  device: device(subsystem=tty)
+  baudrate: list(9600|19200|38400|57600|115200)
+  boot_timeout: int(15,120)
+  # Adds an 8-second settle window on each USB personality change.
+  qemu_usb_reenumeration_workaround: bool

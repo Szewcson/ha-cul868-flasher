@@ -9,7 +9,7 @@ from pathlib import Path
 from signal import SIGINT, SIGTERM, signal
 from threading import Event
 
-from .flasher import Cul868Flasher
+from .flasher import Cul868Flasher, FlashError
 from .ingress import IngressApi, IngressServer
 from .models import Settings, ValidationError
 from .operation import OperationController
@@ -52,6 +52,7 @@ def run() -> None:
     signal(SIGINT, request_stop)
     server.start()
     try:
+        _verify_startup_firmware(flasher)
         while not stopping.is_set():
             operation = controller.get(timeout=0.5)
             if operation is None:
@@ -80,6 +81,17 @@ def run() -> None:
         for pending in controller.drain():
             api.discard_image(pending.image)
         server.stop()
+
+
+def _verify_startup_firmware(flasher: Cul868Flasher) -> None:
+    """Record a current CUL version without making an unavailable device fatal."""
+
+    try:
+        version = flasher.verify_running_application()
+    except FlashError as err:
+        LOGGER.warning("Unable to verify CUL868 firmware at startup: %s", err)
+    else:
+        LOGGER.info("Verified running CUL868 firmware at startup: %s", version)
 
 
 def main() -> None:

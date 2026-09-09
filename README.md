@@ -28,6 +28,10 @@ the add-on sends `B01` to reboot into DFU.
 2. In the add-on configuration, select the normal CUL868 serial device, such
    as `/dev/serial/by-id/...`. Do not choose a bootloader device.
 3. Start the add-on and open its Ingress page.
+   At startup it briefly pauses a matching wmbusmeters instance to read and
+   record the CUL's `V` version response, then restores wmbusmeters. An
+   unavailable CUL or failed read is reported in the add-on log but does not
+   prevent the flasher from starting.
 4. Choose a firmware `.hex` file, then select **Validate firmware**.
 5. Review the SHA-256, application address range, and USB preflight result.
 6. Tick the explicit overwrite confirmation and select **Flash CUL868 V3**.
@@ -63,14 +67,14 @@ erased.
 
 ## wmbusmeters coordination
 
-Before a flash, the add-on reads only the `device` setting from each recognized
-running wmbusmeters add-on's Supervisor-provided options. It pauses and
-restores exactly the instances configured with the selected CUL path, including
-an equivalent resolved `/dev` path. It also pauses `auto` and `cul` discovery
-modes because they can probe the selected serial radio. Other wmbusmeters
-instances remain running. The implementation neither logs nor stores the
-options, which may contain MQTT credentials, and restores paused instances even
-when DFU or verification fails.
+Before a startup version read or a flash, the add-on reads only the `device`
+setting from each recognized running wmbusmeters add-on's Supervisor-provided
+options. It pauses and restores exactly the instances configured with the
+selected CUL path, including an equivalent resolved `/dev` path. It also pauses
+`auto` and `cul` discovery modes because they can probe the selected serial
+radio. Other wmbusmeters instances remain running. The implementation neither
+logs nor stores the options, which may contain MQTT credentials, and restores
+paused instances even when DFU or verification fails.
 
 ## Virtual machines and USB re-enumeration
 

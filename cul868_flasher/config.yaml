@@ -1,5 +1,5 @@
 name: CUL868 Firmware Flasher
-version: 0.1.1
+version: 0.1.2
 slug: cul868_flasher
 description: Manually flash CUL868 V3 firmware through its USB DFU bootloader
 stage: experimental

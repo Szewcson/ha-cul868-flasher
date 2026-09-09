@@ -132,6 +132,37 @@ class Cul868Flasher:
             "message": "Known CUL868 USB DFU bootloader found. Recovery will flash this same USB path.",
         }
 
+    def verify_running_application(self) -> str:
+        """Read and persist the normal CUL version without changing firmware.
+
+        Startup verification takes the same exclusive serial ownership route as
+        flashing: only matching wmbusmeters instances are paused, and their
+        original lifecycle state is restored by the Supervisor context manager.
+        A bootloader-only device deliberately does not qualify for this probe.
+        """
+
+        with self._flash_lock:
+            try:
+                application = self._topology.configured_application(self._settings.device)
+            except UsbTopologyError as err:
+                raise FlashError(f"configured CUL application is unavailable: {err}") from err
+            try:
+                with self._supervisor.temporarily_stop_wmbusmeters(self._settings.device):
+                    version = self._read_version(self._settings.device)
+                    self._state.save(
+                        KnownDevice(
+                            application.topology,
+                            application.usb_serial,
+                            version,
+                            str(self._settings.device),
+                        )
+                    )
+            except FlashError:
+                raise
+            except Exception as err:
+                raise FlashError(f"could not verify the running CUL868 firmware: {err}") from err
+            return version
+
     def flash(self, image: HexImage, report: ProgressReporter) -> dict[str, object]:
         """Execute one non-interruptible verified-image DFU transaction.
 

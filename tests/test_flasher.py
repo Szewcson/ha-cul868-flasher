@@ -131,6 +131,45 @@ class FlasherTests(unittest.TestCase):
             with self.assertRaisesRegex(FlashError, "serial path changed"):
                 flasher.preflight()
 
+    def test_startup_verification_records_version_and_restores_wmbusmeters(self) -> None:
+        topology = FakeTopology()
+        supervisor = FakeSupervisor()
+        serial_factory = FakeSerialFactory(topology, ["V 1.2 CUL868"])
+        with tempfile.TemporaryDirectory() as state_directory:
+            state = DeviceStateStore(Path(state_directory))
+            flasher = Cul868Flasher(
+                self._settings(),
+                topology=topology,
+                state_store=state,
+                supervisor=supervisor,  # type: ignore[arg-type]
+                serial_factory=serial_factory,  # type: ignore[arg-type]
+            )
+            version = flasher.verify_running_application()
+            known = state.load()
+
+        self.assertEqual(version, "V 1.2 CUL868")
+        self.assertEqual(supervisor.events, ["stop", "start"])
+        self.assertEqual(len(serial_factory.sessions), 1)
+        self.assertFalse(serial_factory.sessions[0].entered_bootloader)
+        self.assertIsNotNone(known)
+        assert known is not None
+        self.assertEqual(known.version, "V 1.2 CUL868")
+        self.assertEqual(known.configured_device, "/dev/ttyACM0")
+
+    def test_startup_verification_does_not_pause_wmbusmeters_in_dfu_mode(self) -> None:
+        topology = FakeTopology(mode="bootloader")
+        supervisor = FakeSupervisor()
+        flasher = Cul868Flasher(
+            self._settings(),
+            topology=topology,
+            supervisor=supervisor,  # type: ignore[arg-type]
+        )
+
+        with self.assertRaisesRegex(FlashError, "configured CUL application is unavailable"):
+            flasher.verify_running_application()
+
+        self.assertEqual(supervisor.events, [])
+
     def test_failure_after_reset_keeps_recovery_state_and_restores_wmbusmeters(self) -> None:
         path, image = self._staged_image()
         try:

@@ -7,8 +7,9 @@ from queue import Empty, Full, Queue
 from secrets import token_hex
 from threading import Lock
 from time import time
-from .hexfile import HexImage
 
+from .hexfile import HexImage
+from .usb import ManualRecoveryTarget
 
 _MAX_EVENTS = 32
 
@@ -24,6 +25,7 @@ class FlashOperation:
     operation_id: str
     artifact_id: str
     image: HexImage
+    manual_recovery: ManualRecoveryTarget | None = None
 
 
 class OperationController:
@@ -39,10 +41,15 @@ class OperationController:
         self._error: str | None = None
         self._events: list[dict[str, object]] = []
 
-    def submit(self, artifact_id: str, image: HexImage) -> FlashOperation:
+    def submit(
+        self,
+        artifact_id: str,
+        image: HexImage,
+        manual_recovery: ManualRecoveryTarget | None = None,
+    ) -> FlashOperation:
         if not artifact_id or len(artifact_id) > 128:
             raise ValueError("artifact ID is invalid")
-        operation = FlashOperation(token_hex(16), artifact_id, image)
+        operation = FlashOperation(token_hex(16), artifact_id, image, manual_recovery)
         with self._lock:
             if self._status in {"queued", "running"}:
                 raise OperationBusyError("another CUL868 flash operation is already in progress")

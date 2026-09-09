@@ -5,10 +5,14 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from app.usb import UsbTopology, UsbTopologyError, _read_attribute
+from app.usb import ManualRecoveryTarget, UsbTopology, UsbTopologyError, _read_attribute
 
 
 class UsbTopologyTests(unittest.TestCase):
+    def test_manual_recovery_target_rejects_non_string_serial(self) -> None:
+        with self.assertRaisesRegex(ValueError, "USB serial is invalid"):
+            ManualRecoveryTarget("2-3", 1)  # type: ignore[arg-type]
+
     def test_reads_sysfs_attribute_without_using_synthetic_stat_size(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             attribute = Path(directory) / "idVendor"
@@ -51,9 +55,11 @@ class UsbTopologyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             topology, device = self._make_tree(Path(directory))
             target = topology.configured_application(device)
+            targets = topology.application_targets()
             self.assertEqual(target.topology, "2-3")
             self.assertEqual(target.vid_pid, "03eb:204b")
             self.assertEqual(topology.tty_for_topology("2-3"), device)
+            self.assertEqual(targets, (target,))
 
     def test_refuses_non_cul_serial_endpoint(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -70,3 +76,13 @@ class UsbTopologyTests(unittest.TestCase):
             assert target is not None
             self.assertEqual(target.vid_pid, "03eb:2ff4")
             self.assertIsNone(topology.application_for_topology("2-3"))
+
+    def test_lists_expected_bootloader_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            topology, _device = self._make_tree(Path(directory), "2ff4")
+
+            targets = topology.bootloader_targets()
+
+        self.assertEqual(len(targets), 1)
+        self.assertEqual(targets[0].topology, "2-3")
+        self.assertEqual(targets[0].vid_pid, "03eb:2ff4")

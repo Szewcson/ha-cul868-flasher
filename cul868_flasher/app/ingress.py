@@ -14,10 +14,9 @@ from time import monotonic
 from typing import Any, BinaryIO
 from urllib.parse import urlsplit
 
-from .flasher import Cul868Flasher, FlashError
+from .flasher import Cul868Flasher, FlashError, FlashPreflight
 from .hexfile import MAX_HEX_FILE_BYTES, HexFileError, HexImage, parse_hex_file, write_upload
 from .operation import OperationBusyError, OperationController
-
 
 LOGGER = logging.getLogger(__name__)
 INGRESS_PORT = 8099
@@ -39,7 +38,7 @@ class IngressError(RuntimeError):
 @dataclass
 class _StagedArtifact:
     image: HexImage
-    preflight: dict[str, object]
+    preflight: FlashPreflight
     expires_at: float
     claimed: bool = False
 
@@ -51,7 +50,7 @@ class _ArtifactRegistry:
         self._lock = Lock()
         self._entries: dict[str, _StagedArtifact] = {}
 
-    def stage(self, image: HexImage, preflight: dict[str, object]) -> str:
+    def stage(self, image: HexImage, preflight: FlashPreflight) -> str:
         with self._lock:
             self._remove_expired_locked()
             if len(self._entries) >= _MAX_STAGED_ARTIFACTS:
@@ -64,7 +63,7 @@ class _ArtifactRegistry:
             )
             return identifier
 
-    def claim(self, identifier: object) -> HexImage:
+    def claim(self, identifier: object) -> _StagedArtifact:
         if not isinstance(identifier, str) or not 16 <= len(identifier) <= 128:
             raise IngressError("a validated firmware image is required")
         with self._lock:
@@ -75,7 +74,7 @@ class _ArtifactRegistry:
             if entry.claimed:
                 raise IngressError("validated firmware image is already being flashed")
             entry.claimed = True
-            return entry.image
+            return entry
 
     def release_claim(self, identifier: str) -> None:
         with self._lock:
@@ -127,7 +126,8 @@ class IngressApi:
         self.expire()
         try:
             device = self._flasher.status()
-        except Exception as err:
+        # Status must remain available when an unexpected device probe fails.
+        except Exception as err:  # noqa: BLE001
             device = {
                 "state": "unavailable",
                 "message": f"Could not inspect CUL USB state: {str(err)[:384]}",
@@ -160,16 +160,32 @@ class IngressApi:
                 "application_bytes": image.data_bytes,
                 "address_range": f"0x{image.lowest_address:04x}-0x{image.highest_address:04x}",
             },
-            "preflight": preflight,
+            "preflight": preflight.as_dict(),
         }
 
-    def flash(self, artifact_id: object, confirm: object) -> dict[str, object]:
+    def flash(
+        self,
+        artifact_id: object,
+        confirm: object,
+        confirm_unpaired_recovery: object,
+    ) -> dict[str, object]:
         if confirm is not True:
             raise IngressError("explicit confirmation is required before flashing")
-        image = self._artifacts.claim(artifact_id)
+        artifact = self._artifacts.claim(artifact_id)
         assert isinstance(artifact_id, str)
         try:
-            operation = self._controller.submit(artifact_id, image)
+            if artifact.preflight.manual_recovery is not None:
+                if confirm_unpaired_recovery is not True:
+                    raise IngressError(
+                        "explicit confirmation of the unpaired CUL868 DFU bootloader is required"
+                    )
+            elif confirm_unpaired_recovery is not None and confirm_unpaired_recovery is not False:
+                raise IngressError("unpaired CUL868 DFU recovery was not selected for this upload")
+            operation = self._controller.submit(
+                artifact_id,
+                artifact.image,
+                artifact.preflight.manual_recovery,
+            )
         except Exception:
             self._artifacts.release_claim(artifact_id)
             raise
@@ -266,7 +282,7 @@ class IngressServer:
                 super().setup()
                 self.connection.settimeout(30)
 
-            def do_GET(self) -> None:  # noqa: N802 - required by BaseHTTPRequestHandler.
+            def do_GET(self) -> None:
                 if not self._trusted_proxy():
                     self._json_error(HTTPStatus.FORBIDDEN, "Ingress requests must come from Home Assistant")
                     return
@@ -280,7 +296,7 @@ class IngressServer:
                 else:
                     self._json_error(HTTPStatus.NOT_FOUND, "resource was not found")
 
-            def do_POST(self) -> None:  # noqa: N802 - required by BaseHTTPRequestHandler.
+            def do_POST(self) -> None:
                 # A request body is read exactly once. Closing state-changing
                 # requests prevents bytes beyond Content-Length being reused
                 # as a second HTTP/1.1 request on this connection.
@@ -301,7 +317,11 @@ class IngressServer:
                         )
                     elif path == "/api/flash":
                         body = self._json_body()
-                        response = api.flash(body.get("artifact_id"), body.get("confirm"))
+                        response = api.flash(
+                            body.get("artifact_id"),
+                            body.get("confirm"),
+                            body.get("confirm_unpaired_recovery"),
+                        )
                     else:
                         self._json_error(HTTPStatus.NOT_FOUND, "resource was not found")
                         return

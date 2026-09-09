@@ -9,6 +9,7 @@ import select
 import termios
 from pathlib import Path
 from time import monotonic
+from typing import Self
 
 
 class CulSerialError(RuntimeError):
@@ -35,7 +36,7 @@ class CulSerial:
         self._descriptor: int | None = None
         self._original_attributes: list[object] | None = None
 
-    def __enter__(self) -> CulSerial:
+    def __enter__(self) -> Self:
         if self._baudrate not in _SPEEDS:
             raise CulSerialError(f"unsupported CUL baudrate {self._baudrate}")
         try:
@@ -153,4 +154,3 @@ class CulSerial:
         if self._descriptor is None:
             raise CulSerialError("CUL serial session is not open")
         return self._descriptor
-

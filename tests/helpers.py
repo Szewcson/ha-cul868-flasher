@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator
+from typing import Self
 
+from app.supervisor import WmbusmetersPause
 from app.usb import (
     APPLICATION_PRODUCT_ID,
     APPLICATION_VENDOR_ID,
@@ -61,13 +63,27 @@ class FakeTopology:
         return self.application
 
     def application_for_topology(self, topology: str) -> UsbTarget | None:
-        return self.application if self.mode == "application" and topology == "2-3" else None
+        return (
+            self.application
+            if self.mode == "application" and topology == self.application.topology
+            else None
+        )
+
+    def application_targets(self) -> tuple[UsbTarget, ...]:
+        return (self.application,) if self.mode == "application" else ()
 
     def bootloader_for_topology(self, topology: str) -> UsbTarget | None:
-        return self.bootloader if self.mode == "bootloader" and topology == "2-3" else None
+        return (
+            self.bootloader
+            if self.mode == "bootloader" and topology == self.bootloader.topology
+            else None
+        )
+
+    def bootloader_targets(self) -> tuple[UsbTarget, ...]:
+        return (self.bootloader,) if self.mode == "bootloader" else ()
 
     def tty_for_topology(self, topology: str) -> Path | None:
-        if self.mode == "application" and topology == "2-3":
+        if self.mode == "application" and topology == self.application.topology:
             return Path("/dev/ttyACM0")
         return None
 
@@ -77,17 +93,21 @@ class FakeSerial:
         self._topology = topology
         self._versions = versions
         self.entered_bootloader = False
+        self._open = False
 
-    def __enter__(self) -> FakeSerial:
+    def __enter__(self) -> Self:
+        self._open = True
         return self
 
     def __exit__(self, _exc_type: object, _exc_value: object, _traceback: object) -> None:
-        return None
+        self._open = False
 
     def version(self) -> str:
         return self._versions.pop(0)
 
     def enter_bootloader(self) -> None:
+        if not self._open:
+            raise AssertionError("B01 must be sent while the serial session is open")
         self.entered_bootloader = True
         self._topology.mode = "bootloader"
 
@@ -112,9 +132,14 @@ class FakeSupervisor:
         self.events: list[str] = []
 
     @contextmanager
-    def temporarily_stop_wmbusmeters(self, _device: Path) -> Iterator[tuple[str, ...]]:
+    def temporarily_stop_wmbusmeters(self, _device: Path) -> Iterator[WmbusmetersPause]:
         self.events.append("stop")
+        pause = WmbusmetersPause(self.paused)
         try:
-            yield self.paused
-        finally:
+            yield pause
+        except BaseException:
+            if pause.restore_after_error:
+                self.events.append("start")
+            raise
+        else:
             self.events.append("start")

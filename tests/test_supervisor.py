@@ -37,8 +37,8 @@ class _LifecycleSupervisor(SupervisorClient):
 class SupervisorLifecycleTests(unittest.TestCase):
     def test_restores_only_addon_that_was_initially_running(self) -> None:
         supervisor = _LifecycleSupervisor()
-        with supervisor.temporarily_stop_wmbusmeters(Path("/dev/ttyACM0")) as stopped:
-            self.assertEqual(stopped, ("a0d7b954_wmbusmeters",))
+        with supervisor.temporarily_stop_wmbusmeters(Path("/dev/ttyACM0")) as pause:
+            self.assertEqual(pause.addons, ("a0d7b954_wmbusmeters",))
             self.assertFalse(supervisor.started)
 
         self.assertTrue(supervisor.started)
@@ -49,9 +49,11 @@ class SupervisorLifecycleTests(unittest.TestCase):
 
     def test_stop_poll_failure_still_attempts_restore(self) -> None:
         supervisor = _LifecycleSupervisor(fail_stop_wait_once=True)
-        with self.assertRaisesRegex(SupervisorError, "simulated polling failure"):
-            with supervisor.temporarily_stop_wmbusmeters(Path("/dev/ttyACM0")):
-                self.fail("context must not yield after the stop poll failed")
+        with (
+            self.assertRaisesRegex(SupervisorError, "simulated polling failure"),
+            supervisor.temporarily_stop_wmbusmeters(Path("/dev/ttyACM0")),
+        ):
+            self.fail("context must not yield after the stop poll failed")
 
         self.assertTrue(supervisor.started)
         self.assertEqual(
@@ -61,11 +63,24 @@ class SupervisorLifecycleTests(unittest.TestCase):
 
     def test_leaves_previously_stopped_addon_stopped(self) -> None:
         supervisor = _LifecycleSupervisor(initially_started=False)
-        with supervisor.temporarily_stop_wmbusmeters(Path("/dev/ttyACM0")) as stopped:
-            self.assertEqual(stopped, ())
+        with supervisor.temporarily_stop_wmbusmeters(Path("/dev/ttyACM0")) as pause:
+            self.assertEqual(pause.addons, ())
 
         self.assertFalse(supervisor.started)
         self.assertEqual(supervisor.events, [])
+
+    def test_leaves_matching_addon_stopped_after_an_uncertain_dfu_failure(self) -> None:
+        supervisor = _LifecycleSupervisor()
+        with (
+            self.assertRaisesRegex(RuntimeError, "DFU did not verify") as caught,
+            supervisor.temporarily_stop_wmbusmeters(Path("/dev/ttyACM0")) as pause,
+        ):
+            pause.leave_stopped_after_error()
+            raise RuntimeError("DFU did not verify")
+
+        self.assertFalse(supervisor.started)
+        self.assertEqual(supervisor.events, ["stop:a0d7b954_wmbusmeters"])
+        self.assertIn("wmbusmeters remains stopped", "\n".join(caught.exception.__notes__))
 
     def test_matches_only_direct_path_and_serial_discovery_modes(self) -> None:
         device = Path("/dev/serial/by-id/cul868")

@@ -9,7 +9,6 @@ from hashlib import sha256
 from pathlib import Path
 from typing import BinaryIO
 
-
 MAX_HEX_FILE_BYTES = 512 * 1024
 # CUL V3 itself reserves its 2 KiB bootloader at 0x7800. Upstream
 # dfu-programmer's atmega32u4 target conservatively reserves the top 4 KiB,

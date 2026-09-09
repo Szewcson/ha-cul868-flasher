@@ -3,8 +3,10 @@ configuration:
   device:
     name: CUL868 serial device
     description: >-
-      The normal CUL868 V3 CDC serial device. Select the CUL application
-      device, not a DFU bootloader node.
+      The stable path for the normal CUL868 V3 CDC serial device, usually
+      /dev/serial/by-id/.... Use the CUL application path, not a DFU
+      bootloader node. Keep this path unchanged while the normal endpoint is
+      temporarily absent during DFU recovery.
   baudrate:
     name: Baudrate
     description: >-
@@ -14,9 +16,13 @@ configuration:
     name: USB re-enumeration timeout
     description: >-
       Seconds to wait for the same physical CUL USB port to change between
-      the CUL application and its ATmega32U4 DFU bootloader.
+      the CUL application and its ATmega32U4 DFU bootloader. Active identity
+      transitions always wait at least 90 seconds.
   qemu_usb_reenumeration_workaround:
     name: QEMU USB re-enumeration workaround
     description: >-
-      Add an 8-second settle delay after each USB personality change. Enable
-      this only when direct USB passthrough in a QEMU guest is unreliable.
+      Add an 8-second settle delay before the first USB probe after each
+      personality change. It also permits an exactly-one CUL identity fallback
+      after a verified bootloader request when QEMU assigns a different guest
+      USB port. Enable this only when direct USB passthrough in a QEMU guest is
+      unreliable.

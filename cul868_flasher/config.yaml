@@ -1,5 +1,5 @@
 name: CUL868 Firmware Flasher
-version: 0.1.2
+version: 0.1.6
 slug: cul868_flasher
 description: Manually flash CUL868 V3 firmware through its USB DFU bootloader
 stage: experimental
@@ -28,12 +28,17 @@ tmpfs: true
 options:
   device: null
   baudrate: "9600"
-  boot_timeout: 45
+  boot_timeout: 90
   qemu_usb_reenumeration_workaround: false
 schema:
-  # This is the normal CUL868 CDC endpoint, not a bootloader node.
-  device: device(subsystem=tty)
+  # Do not use device(subsystem=tty): Supervisor validates that the normal
+  # endpoint exists before launch, but it intentionally disappears in DFU.
+  # The app validates this as a bounded /dev path and only flashes a DFU
+  # target at its previously verified physical USB topology, or at one
+  # unpaired bootloader only after an explicit Ingress confirmation.
+  device: str
   baudrate: list(9600|19200|38400|57600|115200)
   boot_timeout: int(15,120)
-  # Adds an 8-second settle window on each USB personality change.
+  # Adds a settle window and permits an exact-one fallback when QEMU moves the
+  # verified CUL to a different guest USB topology during re-enumeration.
   qemu_usb_reenumeration_workaround: bool

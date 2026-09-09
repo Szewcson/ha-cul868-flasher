@@ -14,7 +14,6 @@ from .ingress import IngressApi, IngressServer
 from .models import Settings, ValidationError
 from .operation import OperationController
 
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 LOGGER = logging.getLogger(__name__)
 _MAX_OPTIONS_BYTES = 64 * 1024
@@ -57,22 +56,24 @@ def run() -> None:
             operation = controller.get(timeout=0.5)
             if operation is None:
                 continue
-            controller.mark_running(operation.operation_id)
+            operation_id = operation.operation_id
+            controller.mark_running(operation_id)
             try:
                 result = flasher.flash(
                     operation.image,
-                    lambda percent, message: controller.report_progress(
-                        operation.operation_id, percent, message
+                    lambda percent, message, operation_id=operation_id: controller.report_progress(
+                        operation_id, percent, message
                     ),
+                    manual_recovery=operation.manual_recovery,
                 )
             except Exception as err:
                 LOGGER.exception("CUL868 flash operation failed")
-                controller.fail(operation.operation_id, err)
+                controller.fail(operation_id, err)
             else:
                 installed = result.get("installed_version")
                 LOGGER.info("Verified CUL868 firmware: %s", installed)
                 controller.complete(
-                    operation.operation_id,
+                    operation_id,
                     f"CUL868 firmware verified: {installed or 'version unavailable'}",
                 )
             finally:

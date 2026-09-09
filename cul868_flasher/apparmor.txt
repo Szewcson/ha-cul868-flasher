@@ -75,10 +75,12 @@ profile cul868_flasher flags=(attach_disconnected,mediate_deleted) {
     /sys/devices/** r,
 
     # dfu-programmer only receives raw USB access after Python has matched the
-    # exact physical topology and current bus/device address.
-    /usr/local/bin/dfu-programmer cx -> cul868_flasher_dfu_programmer,
+    # exact physical topology and current bus/device address. Use AppArmor's
+    # executable-named local profile form so the cx transition resolves inside
+    # this Python profile under Home Assistant's profile loader.
+    /usr/local/bin/dfu-programmer cx,
 
-    profile cul868_flasher_dfu_programmer flags=(attach_disconnected,mediate_deleted) {
+    profile /usr/local/bin/dfu-programmer flags=(attach_disconnected,mediate_deleted) {
       #include <abstractions/base>
 
       signal,

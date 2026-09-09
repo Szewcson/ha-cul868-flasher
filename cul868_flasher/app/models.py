@@ -12,7 +12,7 @@ class ValidationError(ValueError):
 
 SUPPORTED_BAUDRATES = frozenset({9_600, 19_200, 38_400, 57_600, 115_200})
 DEFAULT_BAUDRATE = 9_600
-DEFAULT_BOOT_TIMEOUT = 45
+DEFAULT_BOOT_TIMEOUT = 90
 DEFAULT_QEMU_USB_REENUMERATION_WORKAROUND = False
 
 
@@ -85,4 +85,3 @@ class Settings:
                 DEFAULT_QEMU_USB_REENUMERATION_WORKAROUND,
             ),
         )
-

@@ -13,6 +13,7 @@
 }
 
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }
 
 body {
   min-width: 20rem;
@@ -64,6 +65,7 @@ button.danger { background: var(--signal-dark); }
 .confirmation { margin-top: 1.5rem; padding-top: 1.5rem; border-top: 1px solid var(--line); }
 .checkbox { display: flex; gap: .65rem; align-items: flex-start; margin: 1rem 0; line-height: 1.3; }
 .checkbox input { margin-top: .2rem; accent-color: var(--signal-dark); }
+.recovery-confirmation { padding: .8rem; color: #721d10; background: #f5d8cf; }
 .progress { height: .65rem; overflow: hidden; background: var(--paper-deep); }
 .progress span { display: block; width: 0; height: 100%; background: var(--signal); transition: width .2s ease; }
 .error { margin: 1rem 0 0; padding: .75rem; color: #721d10; background: #f5d8cf; font: .85rem/1.4 ui-monospace, monospace; white-space: pre-wrap; }

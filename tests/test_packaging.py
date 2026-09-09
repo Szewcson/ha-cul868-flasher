@@ -3,7 +3,6 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -16,13 +15,16 @@ class PackagingTests(unittest.TestCase):
         self.assertIn("usb: true", config)
         self.assertIn("tmpfs: true", config)
         self.assertNotIn("full_access: true", config)
+        self.assertIn("device: str", config)
+        self.assertNotIn("device: device(subsystem=tty)", config)
 
     def test_dfu_child_profile_has_raw_usb_but_no_network(self) -> None:
         profile = (ROOT / "cul868_flasher" / "apparmor.txt").read_text(encoding="utf-8")
-        child = profile.split("profile cul868_flasher_dfu_programmer", maxsplit=1)[1]
+        child = profile.split("profile /usr/local/bin/dfu-programmer", maxsplit=1)[1]
         self.assertIn("/dev/bus/usb/*/* rw,", child)
         self.assertNotIn("network", child)
-        self.assertIn("/usr/local/bin/dfu-programmer cx -> cul868_flasher_dfu_programmer", profile)
+        self.assertIn("/usr/local/bin/dfu-programmer cx,", profile)
+        self.assertNotIn("cx -> cul868_flasher_dfu_programmer", profile)
 
     def test_dockerfile_ships_dfu_programmer_source_with_the_binary(self) -> None:
         dockerfile = (ROOT / "cul868_flasher" / "Dockerfile").read_text(encoding="utf-8")
@@ -39,3 +41,9 @@ class PackagingTests(unittest.TestCase):
         ignore = (ROOT / "cul868_flasher" / ".dockerignore").read_text(encoding="utf-8")
         self.assertIn("__pycache__/", ignore)
         self.assertIn("*.py[cod]", ignore)
+
+    def test_ingress_hidden_elements_cannot_be_overridden_by_component_layout(self) -> None:
+        styles = (ROOT / "cul868_flasher" / "app" / "web" / "styles.css").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("[hidden] { display: none !important; }", styles)

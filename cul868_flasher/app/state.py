@@ -11,7 +11,6 @@ from threading import Lock
 
 from .usb import validate_usb_topology
 
-
 _MAX_STATE_BYTES = 4 * 1024
 _STATE_FILENAME = "cul868-flasher-state.json"
 

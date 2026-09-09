@@ -6,13 +6,13 @@ import json
 import os
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from time import monotonic, sleep
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
-
 
 _MAX_RESPONSE_BYTES = 256 * 1024
 _REQUEST_TIMEOUT_SECONDS = 15
@@ -22,6 +22,23 @@ _RESTORE_ATTEMPTS = 3
 
 class SupervisorError(RuntimeError):
     """A necessary Home Assistant Supervisor operation did not complete."""
+
+
+@dataclass
+class WmbusmetersPause:
+    """The stopped instances and the safe lifecycle decision for one flash."""
+
+    addons: tuple[str, ...]
+    _restore_after_error: bool = True
+
+    def leave_stopped_after_error(self) -> None:
+        """Keep a reader from reopening a CUL whose firmware is uncertain."""
+
+        self._restore_after_error = False
+
+    @property
+    def restore_after_error(self) -> bool:
+        return self._restore_after_error
 
 
 class SupervisorClient:
@@ -96,12 +113,13 @@ class SupervisorClient:
         )
 
     @contextmanager
-    def temporarily_stop_wmbusmeters(self, device: Path) -> Iterator[tuple[str, ...]]:
+    def temporarily_stop_wmbusmeters(self, device: Path) -> Iterator[WmbusmetersPause]:
         """Pause matching active wmbusmeters instances and restore only those.
 
         This forms a transaction around raw serial/USB access. A failed flash
-        must not leave a previously running meter reader stopped, while an
-        originally stopped reader must remain stopped after the operation.
+        before DFU begins restores a previously running meter reader. Once the
+        CUL may be in DFU or have unverified firmware, the caller can retain
+        the stopped state until the operator has repaired the radio.
         """
 
         stopped: list[str] = []
@@ -116,10 +134,16 @@ class SupervisorClient:
             _add_restore_note(err, self._restore(stopped))
             raise
 
+        pause = WmbusmetersPause(tuple(stopped))
         try:
-            yield tuple(stopped)
+            yield pause
         except BaseException as err:
-            _add_restore_note(err, self._restore(stopped))
+            if pause.restore_after_error:
+                _add_restore_note(err, self._restore(stopped))
+            elif stopped:
+                err.add_note(
+                    "wmbusmeters remains stopped because the CUL firmware did not verify"
+                )
             raise
         else:
             failures = self._restore(stopped)

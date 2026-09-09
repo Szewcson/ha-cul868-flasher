@@ -6,7 +6,6 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-
 APPLICATION_VENDOR_ID = "03eb"
 APPLICATION_PRODUCT_ID = "204b"
 BOOTLOADER_VENDOR_ID = "03eb"
@@ -35,6 +34,25 @@ class UsbTarget:
     @property
     def vid_pid(self) -> str:
         return f"{self.vendor_id}:{self.product_id}"
+
+
+@dataclass(frozen=True)
+class ManualRecoveryTarget:
+    """A bootloader-only target selected by an explicit operator confirmation."""
+
+    topology: str
+    usb_serial: str | None
+
+    def __post_init__(self) -> None:
+        validate_usb_topology(self.topology)
+        if self.usb_serial is not None and (
+            not isinstance(self.usb_serial, str)
+            or not self.usb_serial
+            or len(self.usb_serial) > 128
+            or not self.usb_serial.isascii()
+            or any(ord(character) < 32 or ord(character) > 126 for character in self.usb_serial)
+        ):
+            raise ValueError("USB serial is invalid")
 
 
 def validate_usb_topology(value: object) -> str:
@@ -78,6 +96,11 @@ class UsbTopology:
             "CUL application",
         )
 
+    def application_targets(self) -> tuple[UsbTarget, ...]:
+        """List unique normal CUL applications for a QEMU re-enumeration check."""
+
+        return self._targets_with_identity(APPLICATION_VENDOR_ID, APPLICATION_PRODUCT_ID)
+
     def bootloader_for_topology(self, topology: str) -> UsbTarget | None:
         return self._single_target(
             topology,
@@ -85,6 +108,16 @@ class UsbTopology:
             BOOTLOADER_PRODUCT_ID,
             "ATmega32U4 DFU bootloader",
         )
+
+    def bootloader_targets(self) -> tuple[UsbTarget, ...]:
+        """List unique expected bootloaders for an explicitly confirmed recovery.
+
+        The caller must still require an operator confirmation before using this
+        list.  Deduplicating sysfs aliases avoids treating one physical device
+        as ambiguous, but different physical USB paths always remain distinct.
+        """
+
+        return self._targets_with_identity(BOOTLOADER_VENDOR_ID, BOOTLOADER_PRODUCT_ID)
 
     def tty_for_topology(self, topology: str) -> Path | None:
         """Find the current CDC node for the exact application USB port."""
@@ -125,6 +158,20 @@ class UsbTopology:
         if len(matches) > 1:
             raise UsbTopologyError(f"more than one {label} is present at USB path {topology}")
         return matches[0] if matches else None
+
+    def _targets_with_identity(self, vendor_id: str, product_id: str) -> tuple[UsbTarget, ...]:
+        """Return physical USB targets once, despite duplicate sysfs aliases."""
+
+        targets: dict[Path, UsbTarget] = {}
+        for target in self._all_usb_targets():
+            if target.vendor_id != vendor_id or target.product_id != product_id:
+                continue
+            try:
+                identity = target.sysfs_path.resolve(strict=True)
+            except OSError:
+                identity = target.sysfs_path
+            targets.setdefault(identity, target)
+        return tuple(sorted(targets.values(), key=lambda target: target.topology))
 
     def _target_for_tty(self, tty_name: str) -> UsbTarget:
         if not tty_name.startswith(("ttyACM", "ttyUSB")):

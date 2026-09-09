@@ -5,9 +5,12 @@ const validateButton = document.querySelector("[data-validate]");
 const validation = document.querySelector("[data-validation]");
 const confirmation = document.querySelector("[data-confirmation]");
 const confirmationBox = document.querySelector("[data-confirm]");
+const unpairedRecoveryConfirmation = document.querySelector("[data-unpaired-recovery-confirmation]");
+const unpairedRecoveryBox = document.querySelector("[data-confirm-unpaired-recovery]");
 const flashButton = document.querySelector("[data-flash]");
 const preflight = document.querySelector("[data-preflight]");
 let artifactId = null;
+let requiresUnpairedRecovery = false;
 
 function request(path, options = {}) {
   const headers = { ...(options.headers || {}), "X-Requested-With": "XMLHttpRequest" };
@@ -24,7 +27,16 @@ function request(path, options = {}) {
 
 function setText(selector, value) { document.querySelector(selector).textContent = value || "Unknown"; }
 function describeState(state) {
-  return { application: "CUL application ready", bootloader: "CUL DFU recovery ready", unavailable: "CUL unavailable" }[state] || "CUL state unknown";
+  return {
+    application: "CUL application ready",
+    bootloader: "CUL DFU recovery ready",
+    unpaired_bootloader: "Unpaired CUL DFU bootloader detected",
+    unavailable: "CUL unavailable",
+  }[state] || "CUL state unknown";
+}
+
+function updateFlashButton() {
+  flashButton.disabled = !artifactId || !confirmationBox.checked || (requiresUnpairedRecovery && !unpairedRecoveryBox.checked);
 }
 
 async function refresh() {
@@ -56,14 +68,18 @@ function updateOperation(operation) {
 
 upload.addEventListener("change", () => {
   artifactId = null;
+  requiresUnpairedRecovery = false;
   confirmation.hidden = true;
   confirmationBox.checked = false;
-  flashButton.disabled = true;
+  unpairedRecoveryBox.checked = false;
+  unpairedRecoveryConfirmation.hidden = true;
+  updateFlashButton();
   validation.hidden = true;
   validateButton.disabled = !upload.files || upload.files.length !== 1;
 });
 
-confirmationBox.addEventListener("change", () => { flashButton.disabled = !confirmationBox.checked || !artifactId; });
+confirmationBox.addEventListener("change", updateFlashButton);
+unpairedRecoveryBox.addEventListener("change", updateFlashButton);
 
 validateButton.addEventListener("click", async () => {
   const file = upload.files && upload.files[0];
@@ -80,11 +96,20 @@ validateButton.addEventListener("click", async () => {
     artifactId = payload.artifact_id;
     const firmware = payload.firmware || {};
     const target = payload.preflight || {};
+    requiresUnpairedRecovery = target.requires_unpaired_recovery_confirmation === true;
+    unpairedRecoveryBox.checked = false;
+    unpairedRecoveryConfirmation.hidden = !requiresUnpairedRecovery;
     validation.textContent = `Validated ${firmware.application_bytes || 0} application bytes, SHA-256 ${firmware.sha256 || "unknown"}.`;
     preflight.textContent = target.message || "CUL target preflight completed.";
     confirmation.hidden = false;
+    updateFlashButton();
   } catch (error) {
     artifactId = null;
+    requiresUnpairedRecovery = false;
+    unpairedRecoveryBox.checked = false;
+    unpairedRecoveryConfirmation.hidden = true;
+    confirmation.hidden = true;
+    updateFlashButton();
     validation.textContent = error.message;
   } finally {
     validateButton.disabled = false;
@@ -98,15 +123,22 @@ flashButton.addEventListener("click", async () => {
     await request("api/flash", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ artifact_id: artifactId, confirm: true }),
+      body: JSON.stringify({
+        artifact_id: artifactId,
+        confirm: true,
+        confirm_unpaired_recovery: requiresUnpairedRecovery,
+      }),
     });
     artifactId = null;
+    requiresUnpairedRecovery = false;
+    unpairedRecoveryBox.checked = false;
+    unpairedRecoveryConfirmation.hidden = true;
     confirmation.hidden = true;
     validation.hidden = true;
   } catch (error) {
     document.querySelector("[data-operation-error]").textContent = error.message;
     document.querySelector("[data-operation-error]").hidden = false;
-    flashButton.disabled = !confirmationBox.checked || !artifactId;
+    updateFlashButton();
   }
 });
 

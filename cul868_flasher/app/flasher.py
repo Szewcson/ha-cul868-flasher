@@ -308,7 +308,8 @@ class Cul868Flasher:
                 self._settle_after_usb_change(report, "CUL868 application")
 
                 try:
-                    application, device = self._wait_for_application(
+                    report(90, "Waiting for the CUL868 application serial interface to become ready.")
+                    application, after = self._wait_for_application_version(
                         dfu_topology,
                         expected_usb_serial,
                         self._post_dfu_timeout(),
@@ -320,8 +321,6 @@ class Cul868Flasher:
                             f"QEMU reattached the CUL application on guest USB path "
                             f"{application.topology}.",
                         )
-                    report(90, "Verifying the restarted CUL868 firmware.")
-                    after = self._read_version(device)
                 except FlashError as err:
                     if start_error is not None:
                         raise FlashError(
@@ -620,41 +619,87 @@ class Cul868Flasher:
             f"CUL868 DFU bootloader 03eb:2ff4 did not appear on USB path {topology}: {last_error}"
         )
 
-    def _wait_for_application(
+    def _find_application(
         self,
         topology: str,
-        expected_usb_serial: str | None = None,
-        timeout: int | None = None,
+        expected_usb_serial: str | None,
         *,
-        allow_qemu_topology_change: bool = False,
-    ) -> tuple[UsbTarget, Path]:
-        effective_timeout = self._settings.boot_timeout if timeout is None else timeout
-        deadline = self._monotonic() + effective_timeout
+        allow_qemu_topology_change: bool,
+    ) -> tuple[tuple[UsbTarget, Path] | None, str]:
+        """Return a current application target and TTY, without waiting.
+
+        A regular discovery failure means the CUL can still be starting. An
+        identity mismatch or ambiguity is deliberately allowed to propagate as
+        ``FlashError`` so callers cannot accidentally wait past a safety check.
+        """
+
+        try:
+            application = self._topology.application_for_topology(topology)
+            device = self._topology.tty_for_topology(topology)
+        except UsbTopologyError as err:
+            return None, str(err)
+        if application is not None and device is not None:
+            self._require_expected_usb_serial(
+                application,
+                expected_usb_serial,
+                "CUL868 application on the selected USB path",
+            )
+            return (application, device), ""
+        if not allow_qemu_topology_change:
+            return None, "CUL application has not appeared"
+
+        reenumerated = self._single_reenumerated_target(
+            self._topology.application_targets,
+            expected_usb_serial,
+            "CUL868 application",
+        )
+        if reenumerated is None:
+            return None, "CUL application has not appeared"
+        try:
+            device = self._topology.tty_for_topology(reenumerated.topology)
+        except UsbTopologyError as err:
+            return None, str(err)
+        if device is None:
+            return None, "CUL application serial device has not appeared"
+        return (reenumerated, device), ""
+
+    def _wait_for_application_version(
+        self,
+        topology: str,
+        expected_usb_serial: str | None,
+        timeout: float,
+        *,
+        allow_qemu_topology_change: bool,
+    ) -> tuple[UsbTarget, str]:
+        """Wait for a stable application and its strict CUL identity response.
+
+        A CDC node can exist before its firmware is ready to answer commands.
+        In particular, a firmware transition can include a second reset while
+        it initializes persistent state. Do not mistake the node for proof of
+        a successful flash: both USB discovery and `V` must complete within
+        one bounded post-DFU deadline.
+        """
+
+        deadline = self._monotonic() + timeout
         last_error = "CUL application has not appeared"
         while self._monotonic() < deadline:
-            try:
-                application = self._topology.application_for_topology(topology)
-                device = self._topology.tty_for_topology(topology)
-            except UsbTopologyError as err:
-                last_error = str(err)
-            else:
-                if application is not None and device is not None:
-                    return application, device
-                if allow_qemu_topology_change:
-                    reenumerated = self._single_reenumerated_target(
-                        self._topology.application_targets,
-                        expected_usb_serial,
-                        "CUL868 application",
-                    )
-                    if reenumerated is not None:
-                        try:
-                            device = self._topology.tty_for_topology(reenumerated.topology)
-                        except UsbTopologyError as err:
-                            last_error = str(err)
-                        else:
-                            if device is not None:
-                                return reenumerated, device
-            self._sleep(_POLL_SECONDS)
+            target, last_error = self._find_application(
+                topology,
+                expected_usb_serial,
+                allow_qemu_topology_change=allow_qemu_topology_change,
+            )
+            if target is not None:
+                application, device = target
+                try:
+                    return application, self._read_version_once(device)
+                # A serial adapter can surface platform-specific regular
+                # errors; retry them while the CUL remains in its boot window.
+                except Exception as err:  # noqa: BLE001
+                    last_error = str(err)
+            remaining = deadline - self._monotonic()
+            if remaining > 0:
+                self._sleep(min(_VERSION_RETRY_SECONDS, remaining))
+
         if not allow_qemu_topology_change:
             last_error = self._qemu_topology_hint(
                 self._topology.application_targets,
@@ -663,7 +708,8 @@ class Cul868Flasher:
                 last_error,
             )
         raise FlashError(
-            f"CUL868 application 03eb:204b did not return on USB path {topology}: {last_error}"
+            "CUL868 application did not provide a valid V response within "
+            f"the {int(timeout)}-second post-DFU timeout: {last_error}"
         )
 
     def _single_reenumerated_target(
@@ -727,8 +773,7 @@ class Cul868Flasher:
         last_error: Exception | None = None
         for attempt in range(1, _VERSION_READ_ATTEMPTS + 1):
             try:
-                with self._serial_factory(device, self._settings.baudrate) as serial:
-                    return serial.version()
+                return self._read_version_once(device)
             # A fake or platform-specific serial adapter can surface diverse
             # transport errors; retry regular exceptions but never BaseException.
             except Exception as err:  # noqa: BLE001
@@ -739,6 +784,12 @@ class Cul868Flasher:
         raise FlashError(
             f"CUL868 did not provide a valid V response after {_VERSION_READ_ATTEMPTS} attempts: {last_error}"
         ) from last_error
+
+    def _read_version_once(self, device: Path) -> str:
+        """Own one short serial session and return its validated version line."""
+
+        with self._serial_factory(device, self._settings.baudrate) as serial:
+            return serial.version()
 
     def _run_dfu(
         self, topology: str, expected_usb_serial: str | None, command: str, *arguments: str

@@ -455,6 +455,131 @@ class FlasherTests(unittest.TestCase):
         finally:
             path.unlink(missing_ok=True)
 
+    def test_post_dfu_verification_waits_for_a_culfw_restart(self) -> None:
+        """A CUL endpoint alone is insufficient evidence after a firmware write."""
+
+        path, image = self._staged_image()
+        try:
+            topology = FakeTopology()
+            serial_factory = FakeSerialFactory(
+                topology,
+                [
+                    "V 1.67 CUL868",
+                    RuntimeError("CUL is still restarting"),
+                    RuntimeError("CUL is still restarting"),
+                    "V 1.26.08 a-culfw Build: test CUL868 (F-Band: 868MHz)",
+                ],
+            )
+            clock = [0.0]
+            reports: list[str] = []
+
+            def sleep_for(seconds: float) -> None:
+                clock[0] += seconds
+
+            def runner(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[object]:
+                if command[-1] == "start":
+                    topology.mode = "application"
+                return subprocess.CompletedProcess(command, 0)
+
+            with tempfile.TemporaryDirectory() as state_directory:
+                flasher = Cul868Flasher(
+                    self._settings(),
+                    topology=topology,
+                    state_store=DeviceStateStore(Path(state_directory)),
+                    supervisor=FakeSupervisor(),  # type: ignore[arg-type]
+                    serial_factory=serial_factory,  # type: ignore[arg-type]
+                    dfu_executable="/bin/true",
+                    runner=runner,
+                    sleep_fn=sleep_for,
+                    monotonic_fn=lambda: clock[0],
+                )
+                result = flasher.flash(image, lambda _percent, message: reports.append(message))
+
+            self.assertEqual(
+                result["installed_version"],
+                "V 1.26.08 a-culfw Build: test CUL868 (F-Band: 868MHz)",
+            )
+            self.assertEqual(clock[0], 2)
+            self.assertIn(
+                "Waiting for the CUL868 application serial interface to become ready.", reports
+            )
+        finally:
+            path.unlink(missing_ok=True)
+
+    def test_post_dfu_verification_failure_leaves_wmbusmeters_stopped(self) -> None:
+        path, image = self._staged_image()
+        try:
+            topology = FakeTopology()
+            supervisor = FakeSupervisor()
+            serial_factory = FakeSerialFactory(
+                topology,
+                ["V 1.67 CUL868"] + [RuntimeError("CUL is still restarting")] * 90,
+            )
+            clock = [0.0]
+
+            def sleep_for(seconds: float) -> None:
+                clock[0] += seconds
+
+            def runner(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[object]:
+                if command[-1] == "start":
+                    topology.mode = "application"
+                return subprocess.CompletedProcess(command, 0)
+
+            with tempfile.TemporaryDirectory() as state_directory:
+                state = DeviceStateStore(Path(state_directory))
+                flasher = Cul868Flasher(
+                    self._settings(),
+                    topology=topology,
+                    state_store=state,
+                    supervisor=supervisor,  # type: ignore[arg-type]
+                    serial_factory=serial_factory,  # type: ignore[arg-type]
+                    dfu_executable="/bin/true",
+                    runner=runner,
+                    sleep_fn=sleep_for,
+                    monotonic_fn=lambda: clock[0],
+                )
+                with self.assertRaisesRegex(FlashError, "90-second post-DFU timeout"):
+                    flasher.flash(image, lambda _percent, _message: None)
+                known = state.load()
+
+            self.assertEqual(supervisor.events, ["stop"])
+            self.assertEqual(clock[0], 90)
+            self.assertIsNotNone(known)
+            assert known is not None
+            self.assertIsNone(known.version)
+        finally:
+            path.unlink(missing_ok=True)
+
+    def test_post_dfu_verification_rejects_replaced_application_serial(self) -> None:
+        path, image = self._staged_image()
+        try:
+            topology = FakeTopology()
+            supervisor = FakeSupervisor()
+            serial_factory = FakeSerialFactory(topology, ["V 1.67 CUL868"])
+
+            def runner(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[object]:
+                if command[-1] == "start":
+                    topology.mode = "application"
+                    topology.application = target(serial="OTHER-CUL")
+                return subprocess.CompletedProcess(command, 0)
+
+            with tempfile.TemporaryDirectory() as state_directory:
+                flasher = Cul868Flasher(
+                    self._settings(),
+                    topology=topology,
+                    state_store=DeviceStateStore(Path(state_directory)),
+                    supervisor=supervisor,  # type: ignore[arg-type]
+                    serial_factory=serial_factory,  # type: ignore[arg-type]
+                    dfu_executable="/bin/true",
+                    runner=runner,
+                )
+                with self.assertRaisesRegex(FlashError, "selected USB path has a different USB serial"):
+                    flasher.flash(image, lambda _percent, _message: None)
+
+            self.assertEqual(supervisor.events, ["stop"])
+        finally:
+            path.unlink(missing_ok=True)
+
     def test_qemu_workaround_waits_after_each_identity_transition(self) -> None:
         path, image = self._staged_image()
         try:

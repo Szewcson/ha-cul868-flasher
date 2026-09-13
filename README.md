@@ -118,9 +118,13 @@ application returns. Multiple candidates or a descriptor-serial mismatch are
 always rejected.
 
 The active transition wait is never shorter than 90 seconds and can be
-increased to 120 seconds with **Boot timeout**. This cannot repair a
-passthrough mapping that removes the device from the guest: both personalities
-must still be visible to Home Assistant.
+increased to 120 seconds with **Boot timeout**. It covers both the application
+USB node and its final `V ... CUL868` response: a returned CDC node alone is
+not accepted as a successful flash. This accommodates firmware such as
+a-culfw which can restart again while initializing persistent state after a
+firmware transition. This cannot repair a passthrough mapping that removes the
+device from the guest: both personalities must still be visible to Home
+Assistant.
 
 ## Security model
 

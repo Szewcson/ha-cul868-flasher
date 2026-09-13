@@ -89,7 +89,7 @@ class FakeTopology:
 
 
 class FakeSerial:
-    def __init__(self, topology: FakeTopology, versions: list[str]) -> None:
+    def __init__(self, topology: FakeTopology, versions: list[str | Exception]) -> None:
         self._topology = topology
         self._versions = versions
         self.entered_bootloader = False
@@ -103,7 +103,10 @@ class FakeSerial:
         self._open = False
 
     def version(self) -> str:
-        return self._versions.pop(0)
+        value = self._versions.pop(0)
+        if isinstance(value, Exception):
+            raise value
+        return value
 
     def enter_bootloader(self) -> None:
         if not self._open:
@@ -113,7 +116,7 @@ class FakeSerial:
 
 
 class FakeSerialFactory:
-    def __init__(self, topology: FakeTopology, versions: list[str]) -> None:
+    def __init__(self, topology: FakeTopology, versions: list[str | Exception]) -> None:
         self._topology = topology
         self._versions = versions
         self.calls: list[tuple[Path, int]] = []

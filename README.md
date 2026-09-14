@@ -146,9 +146,12 @@ bootloader but QEMU places it on a different *guest* USB path after `B01`. It
 adds an 8-second settle delay before the first post-transition USB probe and,
 only after a verified CUL has received `B01`, permits one expected DFU target
 to move to another guest path. The same exact-one check applies when the CUL
-application returns. Multiple candidates or a descriptor-serial mismatch on a
-moved guest path are always rejected. A descriptor serial change is accepted
-only on the original physical path after a final valid CUL version response.
+application returns. Multiple candidates are always rejected. CUL application
+firmware and the standard Atmel/LUFA DFU bootloader can publish different USB
+serial descriptors, so a descriptor change is accepted only within that
+verified `B01` to final `V`/`VTS` transition. Once the DFU bootloader has been
+observed, all erase, flash, and start commands are bound to its actual serial
+descriptor and guest topology.
 
 The active transition wait is never shorter than 90 seconds and can be
 increased to 120 seconds with **Boot timeout**. It covers both the application

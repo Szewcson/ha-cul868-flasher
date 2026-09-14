@@ -17,7 +17,12 @@ _STATE_FILENAME = "cul868-flasher-state.json"
 
 @dataclass(frozen=True)
 class KnownDevice:
-    """Non-secret identity of the last verified normal CUL868 USB topology."""
+    """Non-secret CUL identity, with a version only after application verification.
+
+    During an uncertain handoff, ``usb_serial`` is the most recently observed
+    descriptor serial. It is replaced with the application descriptor only
+    after the firmware answers a validated ``V`` or ``VTS`` response.
+    """
 
     topology: str
     usb_serial: str | None

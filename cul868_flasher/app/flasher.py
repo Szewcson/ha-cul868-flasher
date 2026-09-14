@@ -263,50 +263,52 @@ class Cul868Flasher:
             image = self._revalidate_image(image)
             report(3, "Resolving the configured CUL868 USB target.")
             plan = self._plan(manual_recovery=manual_recovery, settings=settings)
-            expected_usb_serial = self._expected_usb_serial(plan)
             allow_qemu_topology_change = settings.qemu_usb_reenumeration_workaround
             with self._supervisor.temporarily_stop_wmbusmeters(settings.device) as pause:
                 if plan.mode == "application":
+                    expected_application_serial = plan.application.usb_serial
                     before = self._enter_bootloader(
                         plan,
                         report,
                         lambda: self._begin_uncertain_transition(
-                            plan, expected_usb_serial, pause.leave_stopped_after_error
+                            plan, pause.leave_stopped_after_error
                         ),
                     )
                     self._settle_after_usb_change(report, "USB DFU bootloader")
                     bootloader = self._wait_for_bootloader(
                         plan.topology,
-                        expected_usb_serial,
+                        expected_application_serial,
                         self._post_dfu_timeout(),
                         allow_qemu_topology_change=allow_qemu_topology_change,
+                        allow_descriptor_serial_change=True,
                     )
                 else:
                     before = plan.known.version if plan.known else None
+                    expected_application_serial = (
+                        plan.known.usb_serial if plan.known is not None else None
+                    )
                     if plan.manual_recovery is not None:
                         report(15, "Using the explicitly confirmed CUL868 USB DFU bootloader.")
                         pause.leave_stopped_after_error()
                     else:
                         report(15, "Using the saved CUL868 USB path in DFU recovery mode.")
-                        self._begin_uncertain_transition(
-                            plan, expected_usb_serial, pause.leave_stopped_after_error
-                        )
+                        self._begin_uncertain_transition(plan, pause.leave_stopped_after_error)
                     bootloader = self._wait_for_bootloader(
                         plan.topology,
-                        expected_usb_serial,
+                        plan.bootloader.usb_serial if plan.bootloader is not None else None,
                         allow_qemu_topology_change=allow_qemu_topology_change,
                     )
 
                 dfu_topology = bootloader.topology
+                # Application firmware and the Atmel/LUFA bootloader are
+                # separate USB personalities and may have different serials.
+                # Persist the observed DFU identity before destructive commands
+                # so recovery can bind to the actual bootloader after a failure.
+                self._store_unverified(plan, bootloader.usb_serial, topology=dfu_topology)
                 if dfu_topology != plan.topology:
                     report(
                         30,
                         f"QEMU reattached the CUL DFU bootloader on guest USB path {dfu_topology}.",
-                    )
-                    self._store_unverified(
-                        plan,
-                        bootloader.usb_serial or expected_usb_serial,
-                        topology=dfu_topology,
                     )
 
                 if plan.manual_recovery is not None:
@@ -314,18 +316,17 @@ class Cul868Flasher:
                     # binding only once erase may change the target.
                     self._store_unverified(
                         plan,
-                        bootloader.usb_serial or expected_usb_serial,
+                        bootloader.usb_serial,
                         topology=dfu_topology,
                     )
                 report(35, "Running the standard CUL DFU erase command.")
-                allow_descriptor_serial_change = dfu_topology == plan.topology
-                self._run_dfu(dfu_topology, expected_usb_serial, "erase")
+                self._run_dfu(dfu_topology, bootloader.usb_serial, "erase")
                 report(55, "Writing the validated firmware image.")
-                self._run_dfu(dfu_topology, expected_usb_serial, "flash", str(image.path))
+                self._run_dfu(dfu_topology, bootloader.usb_serial, "flash", str(image.path))
                 report(78, "Starting the new CUL868 firmware.")
                 start_error: DfuTransferError | None = None
                 try:
-                    self._run_dfu(dfu_topology, expected_usb_serial, "start")
+                    self._run_dfu(dfu_topology, bootloader.usb_serial, "start")
                 except DfuTransferError as err:
                     # The DFU transport can disappear after accepting start.
                     # A live CUL V response is the only success evidence.
@@ -337,10 +338,10 @@ class Cul868Flasher:
                     report(90, "Waiting for the CUL868 application serial interface to become ready.")
                     application, application_device, after = self._wait_for_application_version(
                         dfu_topology,
-                        expected_usb_serial,
+                        expected_application_serial,
                         self._post_dfu_timeout(),
                         allow_qemu_topology_change=allow_qemu_topology_change,
-                        allow_descriptor_serial_change=allow_descriptor_serial_change,
+                        allow_descriptor_serial_change=True,
                     )
                     if application.topology != dfu_topology:
                         report(
@@ -389,14 +390,6 @@ class Cul868Flasher:
                 "firmware_bytes": image.data_bytes,
             }
 
-    @staticmethod
-    def _expected_usb_serial(plan: _FlashPlan) -> str | None:
-        if plan.application is not None:
-            return plan.application.usb_serial
-        if plan.bootloader is not None:
-            return plan.bootloader.usb_serial
-        return plan.known.usb_serial if plan.known is not None else None
-
     def _store_unverified(
         self,
         plan: _FlashPlan,
@@ -413,13 +406,22 @@ class Cul868Flasher:
     def _begin_uncertain_transition(
         self,
         plan: _FlashPlan,
-        usb_serial: str | None,
         leave_stopped_after_error: Callable[[], None],
     ) -> None:
         """Preserve recovery state before a CUL can leave its normal application."""
 
-        self._store_unverified(plan, usb_serial)
+        self._store_unverified(plan, self._transition_usb_serial(plan))
         leave_stopped_after_error()
+
+    @staticmethod
+    def _transition_usb_serial(plan: _FlashPlan) -> str | None:
+        """Keep the best known descriptor identity while a firmware state is unknown."""
+
+        if plan.application is not None:
+            return plan.application.usb_serial
+        if plan.bootloader is not None:
+            return plan.bootloader.usb_serial
+        return plan.known.usb_serial if plan.known is not None else None
 
     def _post_dfu_timeout(self) -> int:
         """Leave enough time for a USB personality change on a virtualized host."""
@@ -478,7 +480,7 @@ class Cul868Flasher:
                 raise SupervisorError(
                     "CUL868 flasher runtime device path changed while the flash was in progress"
                 )
-        except Exception as err:  # noqa: BLE001
+        except Exception as err:
             pause.leave_stopped_after_error()
             raise FlashError(
                 "CUL firmware verified, but its serial-by-id path could not be migrated; "
@@ -585,6 +587,7 @@ class Cul868Flasher:
             and known.usb_serial is not None
             and bootloader.usb_serial is not None
             and known.usb_serial != bootloader.usb_serial
+            and known.version is not None
         ):
             raise FlashError(
                 "DFU device on the saved USB path has a different USB serial number; refusing recovery"
@@ -696,6 +699,7 @@ class Cul868Flasher:
         timeout: int | None = None,
         *,
         allow_qemu_topology_change: bool = False,
+        allow_descriptor_serial_change: bool = False,
     ) -> UsbTarget:
         effective_timeout = self._settings.boot_timeout if timeout is None else timeout
         deadline = self._monotonic() + effective_timeout
@@ -711,6 +715,7 @@ class Cul868Flasher:
                         bootloader,
                         expected_usb_serial,
                         "DFU device on the selected USB path",
+                        allow_descriptor_serial_change=allow_descriptor_serial_change,
                     )
                     return bootloader
                 if allow_qemu_topology_change:
@@ -718,6 +723,7 @@ class Cul868Flasher:
                         self._topology.bootloader_targets,
                         expected_usb_serial,
                         "CUL868 DFU bootloader",
+                        allow_descriptor_serial_change=allow_descriptor_serial_change,
                     )
                     if reenumerated is not None:
                         return reenumerated
@@ -768,6 +774,7 @@ class Cul868Flasher:
             self._topology.application_targets,
             expected_usb_serial,
             "CUL868 application",
+            allow_descriptor_serial_change=allow_descriptor_serial_change,
         )
         if reenumerated is None:
             return None, "CUL application has not appeared"
@@ -835,6 +842,8 @@ class Cul868Flasher:
         discovery: Callable[[], tuple[UsbTarget, ...]],
         expected_usb_serial: str | None,
         label: str,
+        *,
+        allow_descriptor_serial_change: bool = False,
     ) -> UsbTarget | None:
         """Accept a QEMU-moved target only when it is unique and still matches."""
 
@@ -852,7 +861,10 @@ class Cul868Flasher:
             )
         target = targets[0]
         self._require_expected_usb_serial(
-            target, expected_usb_serial, f"{label} on changed guest USB path"
+            target,
+            expected_usb_serial,
+            f"{label} on changed guest USB path",
+            allow_descriptor_serial_change=allow_descriptor_serial_change,
         )
         return target
 

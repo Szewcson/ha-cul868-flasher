@@ -275,6 +275,25 @@ class FlasherTests(unittest.TestCase):
             with self.assertRaisesRegex(FlashError, "different USB serial"):
                 flasher.preflight()
 
+    def test_interrupted_handoff_recovers_when_bootloader_uses_its_own_serial(self) -> None:
+        """A B01 handoff saved before DFU can recover a standard Atmel descriptor."""
+
+        topology = FakeTopology(mode="bootloader", serial="AT32U4-DFU")
+        with tempfile.TemporaryDirectory() as state_directory:
+            state = DeviceStateStore(Path(state_directory))
+            state.save(KnownDevice("2-3", "TSCULFW-CUL868", None, "/dev/ttyACM0"))
+            flasher = Cul868Flasher(
+                self._settings(),
+                topology=topology,
+                state_store=state,
+                supervisor=FakeSupervisor(),  # type: ignore[arg-type]
+            )
+
+            preflight = flasher.preflight()
+
+        self.assertEqual(preflight.mode, "recovery")
+        self.assertEqual(preflight.topology, "2-3")
+
     def test_changed_configured_path_requires_explicit_unpaired_recovery(self) -> None:
         topology = FakeTopology(mode="bootloader", serial="CUL-TEST")
         with tempfile.TemporaryDirectory() as state_directory:
@@ -628,13 +647,20 @@ class FlasherTests(unittest.TestCase):
         finally:
             path.unlink(missing_ok=True)
 
-    def test_active_flash_rejects_changed_bootloader_serial(self) -> None:
+    def test_active_flash_accepts_a_different_bootloader_descriptor_serial(self) -> None:
         path, image = self._staged_image()
         try:
             topology = FakeTopology()
             topology.bootloader = target(bootloader=True, serial="OTHER-CUL")
             supervisor = FakeSupervisor()
-            serial_factory = FakeSerialFactory(topology, ["V 1.67 CUL868"])
+            serial_factory = FakeSerialFactory(
+                topology, ["VTS 0.43 CUL868", "V 1.67 CUL868"]
+            )
+
+            def runner(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[object]:
+                if command[-1] == "start":
+                    topology.mode = "application"
+                return subprocess.CompletedProcess(command, 0)
 
             with tempfile.TemporaryDirectory() as state_directory:
                 flasher = Cul868Flasher(
@@ -643,13 +669,13 @@ class FlasherTests(unittest.TestCase):
                     state_store=DeviceStateStore(Path(state_directory)),
                     supervisor=supervisor,  # type: ignore[arg-type]
                     serial_factory=serial_factory,  # type: ignore[arg-type]
+                    dfu_executable="/bin/true",
+                    runner=runner,
                 )
-                with self.assertRaisesRegex(
-                    FlashError, "DFU device on the selected USB path has a different USB serial"
-                ):
-                    flasher.flash(image, lambda _percent, _message: None)
+                result = flasher.flash(image, lambda _percent, _message: None)
 
-            self.assertEqual(supervisor.events, ["stop"])
+            self.assertEqual(result["installed_version"], "V 1.67 CUL868")
+            self.assertEqual(supervisor.events, ["stop", "start"])
         finally:
             path.unlink(missing_ok=True)
 
@@ -675,10 +701,12 @@ class FlasherTests(unittest.TestCase):
                 path, image = self._staged_image()
                 try:
                     class DescriptorChangingTopology(FakeTopology):
-                        def by_id_paths_for_tty(self, device: Path) -> tuple[Path, ...]:
+                        def by_id_paths_for_tty(
+                            self, device: Path, expected_current: Path = current
+                        ) -> tuple[Path, ...]:
                             if device != Path("/dev/ttyACM0"):
                                 raise AssertionError(f"unexpected CUL endpoint: {device}")
-                            return (current,)
+                            return (expected_current,)
 
                     class RetargetingSupervisor(FakeSupervisor):
                         def __init__(self) -> None:
@@ -700,10 +728,15 @@ class FlasherTests(unittest.TestCase):
                     supervisor = RetargetingSupervisor()
                     serial_factory = FakeSerialFactory(topology, [before, after])
 
-                    def runner(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[object]:
+                    def runner(
+                        command: list[str],
+                        expected_topology: FakeTopology = topology,
+                        expected_usb_serial: str = usb_serial,
+                        **_kwargs: object,
+                    ) -> subprocess.CompletedProcess[object]:
                         if command[-1] == "start":
-                            topology.mode = "application"
-                            topology.application = target(serial=usb_serial)
+                            expected_topology.mode = "application"
+                            expected_topology.application = target(serial=expected_usb_serial)
                         return subprocess.CompletedProcess(command, 0)
 
                     with tempfile.TemporaryDirectory() as state_directory:
@@ -961,7 +994,7 @@ class FlasherTests(unittest.TestCase):
         finally:
             path.unlink(missing_ok=True)
 
-    def test_qemu_workaround_rejects_a_reassigned_dfu_serial_mismatch(self) -> None:
+    def test_qemu_workaround_accepts_a_reassigned_dfu_descriptor_change_after_b01(self) -> None:
         path, image = self._staged_image()
         try:
             topology = FakeTopology()
@@ -970,6 +1003,8 @@ class FlasherTests(unittest.TestCase):
 
             def runner(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[object]:
                 commands.append(command)
+                if command[-1] == "start":
+                    topology.mode = "application"
                 return subprocess.CompletedProcess(command, 0)
 
             with tempfile.TemporaryDirectory() as state_directory:
@@ -978,16 +1013,18 @@ class FlasherTests(unittest.TestCase):
                     topology=topology,
                     state_store=DeviceStateStore(Path(state_directory)),
                     supervisor=FakeSupervisor(),  # type: ignore[arg-type]
-                    serial_factory=FakeSerialFactory(topology, ["V old CUL868"]),  # type: ignore[arg-type]
+                    serial_factory=FakeSerialFactory(
+                        topology, ["V old CUL868", "V recovered CUL868"]
+                    ),  # type: ignore[arg-type]
                     dfu_executable="/bin/true",
                     runner=runner,
                     sleep_fn=lambda _seconds: None,
                 )
 
-                with self.assertRaisesRegex(FlashError, "changed guest USB path has a different USB serial"):
-                    flasher.flash(image, lambda _percent, _message: None)
+                result = flasher.flash(image, lambda _percent, _message: None)
 
-            self.assertEqual(commands, [])
+            self.assertEqual(result["installed_version"], "V recovered CUL868")
+            self.assertEqual([command[2] for command in commands], ["erase", "flash", "start"])
         finally:
             path.unlink(missing_ok=True)
 
@@ -995,7 +1032,9 @@ class FlasherTests(unittest.TestCase):
         path, image = self._staged_image()
         try:
             topology = FakeTopology()
-            topology.bootloader = target(topology="2-4", bootloader=True, address=8)
+            topology.bootloader = target(
+                topology="2-4", bootloader=True, serial="DFU-CUL", address=8
+            )
             supervisor = FakeSupervisor()
 
             def runner(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[object]:
@@ -1021,7 +1060,7 @@ class FlasherTests(unittest.TestCase):
             self.assertIsNotNone(known)
             assert known is not None
             self.assertEqual(known.topology, "2-4")
-            self.assertEqual(known.usb_serial, "CUL-TEST")
+            self.assertEqual(known.usb_serial, "DFU-CUL")
             self.assertIsNone(known.version)
             self.assertEqual(supervisor.events, ["stop"])
         finally:

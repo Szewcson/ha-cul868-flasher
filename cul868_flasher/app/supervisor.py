@@ -42,7 +42,7 @@ class WmbusmetersPause:
 
 
 class SupervisorClient:
-    """Use only the add-on lifecycle endpoints required for a safe flash."""
+    """Use the narrowly scoped Supervisor endpoints required for a safe flash."""
 
     def __init__(self, base_url: str, token: str) -> None:
         if not base_url.startswith("http://") or len(base_url) > 256:
@@ -112,6 +112,45 @@ class SupervisorClient:
             f"{slug} did not reach {expected} state before the timeout (last state: {last_state})"
         )
 
+    def retarget_own_device_path(self, previous: Path, current: Path) -> bool:
+        """Replace this add-on path only if it still names the exact old alias.
+
+        The Supervisor options endpoint has no compare-and-set revision token,
+        so this is a best-effort precondition check rather than an atomic
+        transaction with a simultaneous Configuration UI edit.
+        """
+
+        _require_serial_by_id_path(previous)
+        _require_serial_by_id_path(current)
+        options = self._addon_options("self")
+        if options.get("device") != str(previous):
+            return False
+        updated = dict(options)
+        updated["device"] = str(current)
+        self._set_addon_options("self", updated)
+        return True
+
+    def retarget_paused_wmbusmeters(
+        self, pause: WmbusmetersPause, previous: Path, current: Path
+    ) -> tuple[str, ...]:
+        """Retarget only paused readers that still name the old direct by-id path.
+
+        The options documents can contain credentials. They stay in memory only
+        long enough to replace the one exact serial endpoint and are never logged.
+        """
+
+        _require_serial_by_id_path(previous)
+        _require_serial_by_id_path(current)
+        updated_slugs: list[str] = []
+        for slug in pause.addons:
+            options = self._addon_options(slug)
+            updated = _retarget_wmbusmeters_options(options, previous, current)
+            if updated is None:
+                continue
+            self._set_addon_options(slug, updated)
+            updated_slugs.append(slug)
+        return tuple(updated_slugs)
+
     @contextmanager
     def temporarily_stop_wmbusmeters(self, device: Path) -> Iterator[WmbusmetersPause]:
         """Pause matching active wmbusmeters instances and restore only those.
@@ -174,12 +213,27 @@ class SupervisorClient:
         return failures
 
     def _addon_info(self, slug: str) -> dict[str, Any]:
-        document = self._request("GET", f"/addons/{_quote_slug(slug)}/info")
+        document = self._request("GET", f"/addons/{_addon_path(slug)}/info")
         return _require_mapping(document.get("data"), f"add-on {slug}")
 
-    def _request(self, method: str, path: str) -> dict[str, Any]:
+    def _addon_options(self, slug: str) -> dict[str, Any]:
+        return _require_mapping(self._addon_info(slug).get("options"), f"add-on {slug} options")
+
+    def _set_addon_options(self, slug: str, options: dict[str, Any]) -> None:
+        self._request("POST", f"/addons/{_addon_path(slug)}/options", {"options": options})
+
+    def _request(
+        self, method: str, path: str, payload: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        data: bytes | None = None
+        if payload is not None:
+            try:
+                data = json.dumps(payload, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+            except (TypeError, ValueError) as err:
+                raise SupervisorError(f"Supervisor request {method} {path} has invalid JSON") from err
         request = Request(
             self._base_url + path,
+            data=data,
             method=method,
             headers={
                 "Authorization": f"Bearer {self._token}",
@@ -275,10 +329,79 @@ def _same_device_path(candidate: str, selected_device: Path) -> bool:
         return False
 
 
+def _retarget_wmbusmeters_options(
+    options: object, previous: Path, current: Path
+) -> dict[str, Any] | None:
+    """Copy options while replacing exact direct CUL endpoints, if any."""
+
+    if not isinstance(options, dict):
+        raise SupervisorError("wmbusmeters returned invalid options")
+    configuration = options.get("conf")
+    if isinstance(configuration, dict):
+        section = configuration
+        section_name = "conf"
+    else:
+        section = options
+        section_name = None
+    value = section.get("device")
+    replacement = _retarget_wmbusmeters_device_value(value, previous, current)
+    if replacement is None:
+        return None
+    updated = dict(options)
+    updated_section = dict(section)
+    updated_section["device"] = replacement
+    if section_name is None:
+        updated = updated_section
+    else:
+        updated[section_name] = updated_section
+    return updated
+
+
+def _retarget_wmbusmeters_device_value(
+    value: object, previous: Path, current: Path
+) -> str | None:
+    if not isinstance(value, str) or len(value) > 4_096 or "\x00" in value:
+        return None
+    specifications = value.split(";")
+    replacements = [
+        _retarget_wmbusmeters_device_spec(specification, previous, current)
+        for specification in specifications
+    ]
+    if replacements == specifications:
+        return None
+    return ";".join(replacements)
+
+
+def _retarget_wmbusmeters_device_spec(specification: str, previous: Path, current: Path) -> str:
+    """Replace only the endpoint portion, retaining aliases and mode suffixes."""
+
+    alias, separator, value = specification.partition("=")
+    prefix = f"{alias}{separator}" if separator else ""
+    if not separator:
+        value = specification
+    endpoint, suffix_separator, suffix = value.partition(":")
+    if endpoint.strip() != str(previous):
+        return specification
+    leading_length = len(endpoint) - len(endpoint.lstrip())
+    trailing_length = len(endpoint) - len(endpoint.rstrip())
+    leading = endpoint[:leading_length]
+    trailing = endpoint[len(endpoint) - trailing_length :] if trailing_length else ""
+    return f"{prefix}{leading}{current}{trailing}{suffix_separator}{suffix}"
+
+
 def _quote_slug(slug: str) -> str:
     if not _is_wmbusmeters_slug(slug):
         raise SupervisorError("refusing to control an add-on other than wmbusmeters")
     return quote(slug, safe="_-")
+
+
+def _addon_path(slug: str) -> str:
+    return "self" if slug == "self" else _quote_slug(slug)
+
+
+def _require_serial_by_id_path(value: Path) -> None:
+    if value.parent != Path("/dev/serial/by-id") or value.name in {"", ".", ".."}:
+        raise SupervisorError("refusing to migrate a device path outside /dev/serial/by-id")
 
 
 def _require_mapping(value: object, label: str) -> dict[str, Any]:

@@ -9,6 +9,7 @@ from app.flasher import Cul868Flasher, FlashError
 from app.hexfile import parse_hex_file
 from app.models import Settings
 from app.state import DeviceStateStore, KnownDevice
+from app.supervisor import WmbusmetersPause
 
 from .helpers import FakeSerialFactory, FakeSupervisor, FakeTopology, minimal_hex, target
 
@@ -22,9 +23,9 @@ class FlasherTests(unittest.TestCase):
         return path, parse_hex_file(path)
 
     @staticmethod
-    def _settings(qemu: bool = False) -> Settings:
+    def _settings(qemu: bool = False, device: Path | None = None) -> Settings:
         return Settings(
-            device=Path("/dev/ttyACM0"),
+            device=device or Path("/dev/ttyACM0"),
             baudrate=9600,
             boot_timeout=15,
             qemu_usb_reenumeration_workaround=qemu,
@@ -506,6 +507,53 @@ class FlasherTests(unittest.TestCase):
         finally:
             path.unlink(missing_ok=True)
 
+    def test_post_dfu_verification_waits_for_tsculf_usb_reconnect(self) -> None:
+        """TSCULFW must reconnect its CDC endpoint before the V request is sent."""
+
+        path, image = self._staged_image()
+        try:
+            clock = [0.0]
+
+            class DelayedTsculfTopology(FakeTopology):
+                def application_for_topology(self, topology: str) -> object:
+                    if clock[0] >= 5.5:
+                        self.mode = "application"
+                    return super().application_for_topology(topology)
+
+            topology = DelayedTsculfTopology()
+            serial_factory = FakeSerialFactory(
+                topology,
+                ["V 1.67 CUL868", "VTS 0.43 CUL868"],
+            )
+
+            def sleep_for(seconds: float) -> None:
+                clock[0] += seconds
+
+            def runner(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[object]:
+                # TSCULFW keeps USB disconnected for about 5.5 seconds after
+                # this command. The topology exposes its fresh CDC endpoint later.
+                return subprocess.CompletedProcess(command, 0)
+
+            with tempfile.TemporaryDirectory() as state_directory:
+                flasher = Cul868Flasher(
+                    self._settings(),
+                    topology=topology,
+                    state_store=DeviceStateStore(Path(state_directory)),
+                    supervisor=FakeSupervisor(),  # type: ignore[arg-type]
+                    serial_factory=serial_factory,  # type: ignore[arg-type]
+                    dfu_executable="/bin/true",
+                    runner=runner,
+                    sleep_fn=sleep_for,
+                    monotonic_fn=lambda: clock[0],
+                )
+                result = flasher.flash(image, lambda _percent, _message: None)
+
+            self.assertEqual(result["installed_version"], "VTS 0.43 CUL868")
+            self.assertGreaterEqual(clock[0], 5.5)
+            self.assertEqual(len(serial_factory.sessions), 2)
+        finally:
+            path.unlink(missing_ok=True)
+
     def test_post_dfu_verification_failure_leaves_wmbusmeters_stopped(self) -> None:
         path, image = self._staged_image()
         try:
@@ -550,12 +598,12 @@ class FlasherTests(unittest.TestCase):
         finally:
             path.unlink(missing_ok=True)
 
-    def test_post_dfu_verification_rejects_replaced_application_serial(self) -> None:
+    def test_post_dfu_verification_accepts_direct_firmware_descriptor_change(self) -> None:
         path, image = self._staged_image()
         try:
             topology = FakeTopology()
             supervisor = FakeSupervisor()
-            serial_factory = FakeSerialFactory(topology, ["V 1.67 CUL868"])
+            serial_factory = FakeSerialFactory(topology, ["V 1.67 CUL868", "VTS 0.43 CUL868"])
 
             def runner(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[object]:
                 if command[-1] == "start":
@@ -573,12 +621,192 @@ class FlasherTests(unittest.TestCase):
                     dfu_executable="/bin/true",
                     runner=runner,
                 )
-                with self.assertRaisesRegex(FlashError, "selected USB path has a different USB serial"):
+                result = flasher.flash(image, lambda _percent, _message: None)
+
+            self.assertEqual(result["installed_version"], "VTS 0.43 CUL868")
+            self.assertEqual(supervisor.events, ["stop", "start"])
+        finally:
+            path.unlink(missing_ok=True)
+
+    def test_active_flash_rejects_changed_bootloader_serial(self) -> None:
+        path, image = self._staged_image()
+        try:
+            topology = FakeTopology()
+            topology.bootloader = target(bootloader=True, serial="OTHER-CUL")
+            supervisor = FakeSupervisor()
+            serial_factory = FakeSerialFactory(topology, ["V 1.67 CUL868"])
+
+            with tempfile.TemporaryDirectory() as state_directory:
+                flasher = Cul868Flasher(
+                    self._settings(),
+                    topology=topology,
+                    state_store=DeviceStateStore(Path(state_directory)),
+                    supervisor=supervisor,  # type: ignore[arg-type]
+                    serial_factory=serial_factory,  # type: ignore[arg-type]
+                )
+                with self.assertRaisesRegex(
+                    FlashError, "DFU device on the selected USB path has a different USB serial"
+                ):
                     flasher.flash(image, lambda _percent, _message: None)
 
             self.assertEqual(supervisor.events, ["stop"])
         finally:
             path.unlink(missing_ok=True)
+
+    def test_flash_migrates_by_id_path_across_culfw_families(self) -> None:
+        cases = (
+            (
+                Path("/dev/serial/by-id/usb-busware.de_CUL868-culfw-if00"),
+                Path("/dev/serial/by-id/usb-busware.de_CUL868-tsculfw-if00"),
+                "V 1.67 CUL868",
+                "VTS 0.43 CUL868",
+                "TSCULFW-CUL868",
+            ),
+            (
+                Path("/dev/serial/by-id/usb-busware.de_CUL868-tsculfw-if00"),
+                Path("/dev/serial/by-id/usb-busware.de_CUL868-a-culfw-if00"),
+                "VTS 0.43 CUL868",
+                "V 1.26.08 a-culfw Build: test CUL868 (F-Band: 868MHz)",
+                "A-CULFW-CUL868",
+            ),
+        )
+        for previous, current, before, after, usb_serial in cases:
+            with self.subTest(before=before, after=after):
+                path, image = self._staged_image()
+                try:
+                    class DescriptorChangingTopology(FakeTopology):
+                        def by_id_paths_for_tty(self, device: Path) -> tuple[Path, ...]:
+                            if device != Path("/dev/ttyACM0"):
+                                raise AssertionError(f"unexpected CUL endpoint: {device}")
+                            return (current,)
+
+                    class RetargetingSupervisor(FakeSupervisor):
+                        def __init__(self) -> None:
+                            super().__init__()
+                            self.wmbus_retargets: list[tuple[Path, Path]] = []
+                            self.own_retargets: list[tuple[Path, Path]] = []
+
+                        def retarget_paused_wmbusmeters(
+                            self, _pause: object, old: Path, new: Path
+                        ) -> tuple[str, ...]:
+                            self.wmbus_retargets.append((old, new))
+                            return ("wmbusmeters",)
+
+                        def retarget_own_device_path(self, old: Path, new: Path) -> bool:
+                            self.own_retargets.append((old, new))
+                            return True
+
+                    topology = DescriptorChangingTopology()
+                    supervisor = RetargetingSupervisor()
+                    serial_factory = FakeSerialFactory(topology, [before, after])
+
+                    def runner(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[object]:
+                        if command[-1] == "start":
+                            topology.mode = "application"
+                            topology.application = target(serial=usb_serial)
+                        return subprocess.CompletedProcess(command, 0)
+
+                    with tempfile.TemporaryDirectory() as state_directory:
+                        state = DeviceStateStore(Path(state_directory))
+                        flasher = Cul868Flasher(
+                            self._settings(device=previous),
+                            topology=topology,
+                            state_store=state,
+                            supervisor=supervisor,  # type: ignore[arg-type]
+                            serial_factory=serial_factory,  # type: ignore[arg-type]
+                            dfu_executable="/bin/true",
+                            runner=runner,
+                        )
+                        result = flasher.flash(image, lambda _percent, _message: None)
+                        known = state.load()
+
+                    self.assertEqual(result["device"], str(current))
+                    self.assertEqual(result["retargeted_wmbusmeters_addons"], ["wmbusmeters"])
+                    self.assertEqual(supervisor.wmbus_retargets, [(previous, current)])
+                    self.assertEqual(supervisor.own_retargets, [(previous, current)])
+                    self.assertEqual(supervisor.events, ["stop", "start"])
+                    self.assertIsNotNone(known)
+                    assert known is not None
+                    self.assertEqual(known.usb_serial, usb_serial)
+                    self.assertEqual(known.configured_device, str(current))
+                finally:
+                    path.unlink(missing_ok=True)
+
+    def test_flash_refuses_ambiguous_changed_by_id_paths_and_leaves_readers_stopped(self) -> None:
+        path, image = self._staged_image()
+        previous = Path("/dev/serial/by-id/usb-busware.de_CUL868-old-if00")
+        try:
+            class AmbiguousAliasTopology(FakeTopology):
+                def by_id_paths_for_tty(self, _device: Path) -> tuple[Path, ...]:
+                    return (
+                        Path("/dev/serial/by-id/usb-busware.de_CUL868-first-if00"),
+                        Path("/dev/serial/by-id/usb-busware.de_CUL868-second-if00"),
+                    )
+
+            topology = AmbiguousAliasTopology()
+            supervisor = FakeSupervisor()
+            serial_factory = FakeSerialFactory(topology, ["V 1.67 CUL868", "VTS 0.43 CUL868"])
+
+            def runner(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[object]:
+                if command[-1] == "start":
+                    topology.mode = "application"
+                    topology.application = target(serial="TSCULFW-CUL868")
+                return subprocess.CompletedProcess(command, 0)
+
+            with tempfile.TemporaryDirectory() as state_directory:
+                state = DeviceStateStore(Path(state_directory))
+                flasher = Cul868Flasher(
+                    self._settings(device=previous),
+                    topology=topology,
+                    state_store=state,
+                    supervisor=supervisor,  # type: ignore[arg-type]
+                    serial_factory=serial_factory,  # type: ignore[arg-type]
+                    dfu_executable="/bin/true",
+                    runner=runner,
+                )
+                with self.assertRaisesRegex(FlashError, "multiple /dev/serial/by-id aliases"):
+                    flasher.flash(image, lambda _percent, _message: None)
+                known = state.load()
+
+            self.assertEqual(supervisor.events, ["stop"])
+            self.assertIsNotNone(known)
+            assert known is not None
+            self.assertEqual(known.version, "VTS 0.43 CUL868")
+            self.assertEqual(known.configured_device, str(previous))
+        finally:
+            path.unlink(missing_ok=True)
+
+    def test_serial_by_id_migration_failure_keeps_wmbusmeters_paused(self) -> None:
+        previous = Path("/dev/serial/by-id/usb-busware.de_CUL868-old-if00")
+        current = Path("/dev/serial/by-id/usb-busware.de_CUL868-new-if00")
+
+        class OneAliasTopology(FakeTopology):
+            def by_id_paths_for_tty(self, _device: Path) -> tuple[Path, ...]:
+                return (current,)
+
+        class FailingSupervisor(FakeSupervisor):
+            def retarget_paused_wmbusmeters(
+                self, _pause: object, _old: Path, _new: Path
+            ) -> tuple[str, ...]:
+                raise RuntimeError("simulated Supervisor transport failure")
+
+        supervisor = FailingSupervisor()
+        flasher = Cul868Flasher(
+            self._settings(device=previous),
+            topology=OneAliasTopology(),
+            supervisor=supervisor,  # type: ignore[arg-type]
+        )
+        pause = WmbusmetersPause(("wmbusmeters",))
+
+        with self.assertRaisesRegex(FlashError, "serial-by-id path could not be migrated"):
+            flasher._migrate_serial_by_id_path(
+                previous,
+                Path("/dev/ttyACM0"),
+                pause,
+                lambda _percent, _message: None,
+            )
+
+        self.assertFalse(pause.restore_after_error)
 
     def test_qemu_workaround_waits_after_each_identity_transition(self) -> None:
         path, image = self._staged_image()

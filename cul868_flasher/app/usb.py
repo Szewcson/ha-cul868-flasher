@@ -144,6 +144,33 @@ class UsbTopology:
             )
         return matches[0] if matches else None
 
+    def by_id_paths_for_tty(self, tty: Path) -> tuple[Path, ...]:
+        """List current ``/dev/serial/by-id`` aliases for one discovered TTY.
+
+        Firmware families may publish different USB manufacturer, product, or
+        serial descriptors, so their by-id filename can change after a valid
+        flash. Only return aliases that resolve to the already topology-checked
+        TTY; selecting among multiple aliases remains a caller safety decision.
+        """
+
+        try:
+            resolved_tty = tty.resolve(strict=True)
+        except OSError:
+            return ()
+        directory = self._dev_directory / "serial" / "by-id"
+        try:
+            entries = tuple(directory.iterdir())
+        except OSError:
+            return ()
+        matches: list[Path] = []
+        for entry in entries:
+            try:
+                if entry.is_symlink() and entry.resolve(strict=True) == resolved_tty:
+                    matches.append(entry)
+            except OSError:
+                continue
+        return tuple(sorted(matches, key=lambda path: path.name))
+
     def _single_target(
         self, topology: str, vendor_id: str, product_id: str, label: str
     ) -> UsbTarget | None:

@@ -13,13 +13,19 @@ DFU, and validates the uploaded Intel HEX file before it can be queued.
 
 | USB state | VID:PID | Expected characteristic | Add-on handling |
 | --- | --- | --- | --- |
-| CULFW, a-culfw, or TSCUL normal CUL868 application | `03eb:204b` | CDC serial device; firmware answers `V` with `CUL868` | Required configured device |
+| CULFW/CULFW1, a-culfw, or TSCULFW normal CUL868 application | `03eb:204b` | CDC serial device; firmware answers `V\r\n` with `V ... CUL868` or `VTS ... CUL868` | Required configured device |
 | CUL868 V3 bootloader | `03eb:2ff4` | ATmega32U4-compatible DFU | Automatic recovery only on a saved path; otherwise one explicitly confirmed unique target |
 | Older CUL bootloader | `03eb:2ffa` | Different legacy CUL target | Intentionally unsupported |
 
 The normal `03eb:204b` descriptor is shared by the CUL firmware families
 above. The serial `V` response is therefore the final identity check before
 the add-on sends `B01` to reboot into DFU.
+
+[Smarthome Agentur CULFW1](https://github.com/smarthomeagentur/culfw1) is a
+historical CULFW source clone and uses the regular `V ... CUL868` convention.
+TSCULFW-derived targets use `VTS ... CUL868` instead. The add-on supports both
+response forms, but never trusts a firmware family name or USB descriptor name
+as the sole identity check.
 
 ## Install and use
 
@@ -81,6 +87,30 @@ If no expected bootloader is visible, or more than one is visible, recovery is
 refused. Reattach or detach devices until the intended bootloader is the only
 candidate; the add-on will never choose one arbitrarily.
 
+## Firmware-owned serial names
+
+CULFW-family firmware can publish different USB manufacturer, product, or
+serial descriptors. A transition between CULFW, a-culfw, and TSCULFW can
+therefore legitimately change the `/dev/serial/by-id/...` filename even though
+the physical CUL868 is the same device.
+
+After the new firmware has appeared on the already verified physical USB path
+and answered `V` or `VTS`, the add-on checks the aliases that resolve to that
+exact new CDC endpoint. If the configured path is a direct
+`/dev/serial/by-id/...` alias, its old alias disappeared, and exactly one new
+alias exists, the add-on updates its own option and the exact direct path in
+any wmbusmeters instances it paused for this flash. The running process also
+uses the new path for a later operation without requiring a restart.
+
+The migration deliberately refuses to guess when no alias or more than one
+alias resolves to the verified endpoint, or when the add-on option no longer
+contains the expected old path when it is checked. In that case the firmware is
+still reported as verified, but matching wmbusmeters instances remain stopped
+until the path is resolved manually. `auto`, `cul`, raw `/dev/ttyACM*`, and
+unrelated wmbusmeters configurations are never rewritten. Avoid editing either
+add-on's device option during a flash: the Supervisor options API does not
+provide an atomic compare-and-set update.
+
 ## wmbusmeters coordination
 
 Before a startup version read or a flash, the add-on reads only the `device`
@@ -88,8 +118,10 @@ setting from each recognized running wmbusmeters add-on's Supervisor-provided
 options. It pauses and restores exactly the instances configured with the
 selected CUL path, including an equivalent resolved `/dev` path. It also pauses
 `auto` and `cul` discovery modes because they can probe the selected serial
-radio. Other wmbusmeters instances remain running. The implementation neither
-logs nor stores the options, which may contain MQTT credentials.
+radio. Other wmbusmeters instances remain running. Following a verified,
+unambiguous serial-by-id migration, it updates only the exact path values for
+the instances it paused. The implementation neither logs nor stores the
+options, which may contain MQTT credentials.
 
 A startup version check or a flash that fails before DFU begins restores those
 instances. Once the add-on requests `B01`, or begins bootloader-only recovery,
@@ -114,17 +146,20 @@ bootloader but QEMU places it on a different *guest* USB path after `B01`. It
 adds an 8-second settle delay before the first post-transition USB probe and,
 only after a verified CUL has received `B01`, permits one expected DFU target
 to move to another guest path. The same exact-one check applies when the CUL
-application returns. Multiple candidates or a descriptor-serial mismatch are
-always rejected.
+application returns. Multiple candidates or a descriptor-serial mismatch on a
+moved guest path are always rejected. A descriptor serial change is accepted
+only on the original physical path after a final valid CUL version response.
 
 The active transition wait is never shorter than 90 seconds and can be
 increased to 120 seconds with **Boot timeout**. It covers both the application
-USB node and its final `V ... CUL868` response: a returned CDC node alone is
-not accepted as a successful flash. This accommodates firmware such as
-a-culfw which can restart again while initializing persistent state after a
-firmware transition. This cannot repair a passthrough mapping that removes the
-device from the guest: both personalities must still be visible to Home
-Assistant.
+USB node and its final `V ... CUL868` or `VTS ... CUL868` response: a returned
+CDC node alone is not accepted as a successful flash. This accommodates
+firmware such as a-culfw which can restart again while initializing persistent
+state after a firmware transition, and TSCULFW, which deliberately delays its
+CDC reconnect by about 5.5 seconds after reset. After a fresh endpoint appears,
+the add-on configures 8N1 and sends the documented `V\r\n` request. This cannot
+repair a passthrough mapping that removes the device from the guest: both
+personalities must still be visible to Home Assistant.
 
 ## Security model
 
@@ -145,9 +180,10 @@ Assistant.
   network permission. The Python process has no raw USB device-node access.
 
 The add-on requests Home Assistant's `manager` role only because the Supervisor
-requires it to read an add-on's device option and to stop/start a matching
-wmbusmeters app around a flash. The role grants broader Supervisor authority
-than this implementation uses, so install it only from a trusted repository.
+requires it to read/update an add-on's exact device option and to stop/start a
+matching wmbusmeters app around a flash. The role grants broader Supervisor
+authority than this implementation uses, so install it only from a trusted
+repository.
 The relevant option and lifecycle endpoints are documented in the [Home
 Assistant Supervisor API](https://developers.home-assistant.io/docs/api/supervisor/endpoints/).
 

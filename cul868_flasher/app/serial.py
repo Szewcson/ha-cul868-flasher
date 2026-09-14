@@ -24,6 +24,7 @@ _SPEEDS = {
     115_200: termios.B115200,
 }
 _READ_LIMIT = 2 * 1024
+_VERSION_PREFIXES = (b"V ", b"VTS ")
 
 
 class CulSerial:
@@ -90,8 +91,10 @@ class CulSerial:
     def version(self) -> str:
         """Read a bounded `V` response and prove that the application calls itself CUL868."""
 
-        response = self._request_line(b"V\n")
-        if not response.startswith("V ") or "CUL868" not in response:
+        # TSCULFW reconnects its CDC device after reset and documents `V\r\n`
+        # with a `VTS ...` response. CULFW and a-culfw retain the `V ...` form.
+        response = self._request_version_line()
+        if "CUL868" not in response:
             raise CulSerialError(
                 "selected USB device did not identify itself as CUL868 in response to V"
             )
@@ -108,8 +111,10 @@ class CulSerial:
             if getattr(err, "errno", None) not in {errno.EIO, errno.ENODEV}:
                 raise CulSerialError(f"CUL bootloader command could not drain: {err}") from err
 
-    def _request_line(self, command: bytes) -> str:
-        self._write_all(command)
+    def _request_version_line(self) -> str:
+        """Return one supported CUL version line after the documented CRLF request."""
+
+        self._write_all(b"V\r\n")
         descriptor = self._require_descriptor()
         deadline = monotonic() + self._timeout
         response = bytearray()
@@ -125,7 +130,7 @@ class CulSerial:
                 continue
             response.extend(chunk)
             for line in response.replace(b"\r", b"\n").split(b"\n"):
-                if line.startswith(b"V "):
+                if line.startswith(_VERSION_PREFIXES):
                     try:
                         return line.decode("ascii")
                     except UnicodeDecodeError as err:

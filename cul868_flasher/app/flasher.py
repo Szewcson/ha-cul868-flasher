@@ -9,7 +9,7 @@ import subprocess
 import tempfile
 from collections.abc import Callable
 from contextlib import AbstractContextManager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from threading import Lock
 from time import monotonic, sleep
@@ -19,7 +19,7 @@ from .hexfile import HexImage, parse_hex_file
 from .models import Settings
 from .serial import CulSerial
 from .state import DeviceStateStore, KnownDevice
-from .supervisor import SupervisorClient
+from .supervisor import SupervisorClient, SupervisorError, WmbusmetersPause
 from .usb import ManualRecoveryTarget, UsbTarget, UsbTopology, UsbTopologyError
 
 _DFU_EXECUTABLE = "/usr/local/bin/dfu-programmer"
@@ -110,14 +110,36 @@ class Cul868Flasher:
         self._sleep = sleep_fn
         self._monotonic = monotonic_fn
         self._flash_lock = Lock()
+        # Settings instances are immutable. Guard replacing the instance after
+        # a verified firmware descriptor change so status readers see one
+        # complete configuration, never a partially updated path.
+        self._settings_lock = Lock()
+
+    def _settings_snapshot(self) -> Settings:
+        """Return the immutable settings instance currently used by the worker."""
+
+        with self._settings_lock:
+            return self._settings
+
+    def _replace_configured_device(self, previous: Path, current: Path) -> bool:
+        """Apply a Supervisor-persisted path migration to the live worker safely."""
+
+        with self._settings_lock:
+            if self._settings.device != previous:
+                return False
+            self._settings = replace(self._settings, device=current)
+            return True
 
     def status(self) -> dict[str, object]:
         """Report USB presence without opening the serial device or stopping apps."""
 
+        settings = self._settings_snapshot()
         known = self._state.load()
-        known_for_config = known if self._state_matches_configuration(known) else None
+        known_for_config = (
+            known if self._state_matches_configuration(known, settings.device) else None
+        )
         try:
-            application = self._topology.configured_application(self._settings.device)
+            application = self._topology.configured_application(settings.device)
         except UsbTopologyError as application_error:
             if known_for_config is not None:
                 try:
@@ -161,7 +183,8 @@ class Cul868Flasher:
     def preflight(self) -> FlashPreflight:
         """Resolve a safe target before accepting a confirmation to flash it."""
 
-        plan = self._plan(allow_unpaired_recovery=True)
+        settings = self._settings_snapshot()
+        plan = self._plan(allow_unpaired_recovery=True, settings=settings)
         if plan.mode == "application":
             return FlashPreflight(
                 "application",
@@ -200,19 +223,20 @@ class Cul868Flasher:
         """
 
         with self._flash_lock:
+            settings = self._settings_snapshot()
             try:
-                application = self._topology.configured_application(self._settings.device)
+                application = self._topology.configured_application(settings.device)
             except UsbTopologyError as err:
                 raise FlashError(f"configured CUL application is unavailable: {err}") from err
             try:
-                with self._supervisor.temporarily_stop_wmbusmeters(self._settings.device):
-                    version = self._read_version(self._settings.device)
+                with self._supervisor.temporarily_stop_wmbusmeters(settings.device):
+                    version = self._read_version(settings.device)
                     self._state.save(
                         KnownDevice(
                             application.topology,
                             application.usb_serial,
                             version,
-                            str(self._settings.device),
+                            str(settings.device),
                         )
                     )
             except FlashError:
@@ -235,12 +259,13 @@ class Cul868Flasher:
         """
 
         with self._flash_lock:
+            settings = self._settings_snapshot()
             image = self._revalidate_image(image)
             report(3, "Resolving the configured CUL868 USB target.")
-            plan = self._plan(manual_recovery=manual_recovery)
+            plan = self._plan(manual_recovery=manual_recovery, settings=settings)
             expected_usb_serial = self._expected_usb_serial(plan)
-            allow_qemu_topology_change = self._settings.qemu_usb_reenumeration_workaround
-            with self._supervisor.temporarily_stop_wmbusmeters(self._settings.device) as pause:
+            allow_qemu_topology_change = settings.qemu_usb_reenumeration_workaround
+            with self._supervisor.temporarily_stop_wmbusmeters(settings.device) as pause:
                 if plan.mode == "application":
                     before = self._enter_bootloader(
                         plan,
@@ -293,6 +318,7 @@ class Cul868Flasher:
                         topology=dfu_topology,
                     )
                 report(35, "Running the standard CUL DFU erase command.")
+                allow_descriptor_serial_change = dfu_topology == plan.topology
                 self._run_dfu(dfu_topology, expected_usb_serial, "erase")
                 report(55, "Writing the validated firmware image.")
                 self._run_dfu(dfu_topology, expected_usb_serial, "flash", str(image.path))
@@ -309,11 +335,12 @@ class Cul868Flasher:
 
                 try:
                     report(90, "Waiting for the CUL868 application serial interface to become ready.")
-                    application, after = self._wait_for_application_version(
+                    application, application_device, after = self._wait_for_application_version(
                         dfu_topology,
                         expected_usb_serial,
                         self._post_dfu_timeout(),
                         allow_qemu_topology_change=allow_qemu_topology_change,
+                        allow_descriptor_serial_change=allow_descriptor_serial_change,
                     )
                     if application.topology != dfu_topology:
                         report(
@@ -332,15 +359,32 @@ class Cul868Flasher:
                         application.topology,
                         application.usb_serial,
                         after,
-                        str(self._settings.device),
+                        str(settings.device),
                     )
                 )
+                configured_device, retargeted_wmbusmeters = self._migrate_serial_by_id_path(
+                    settings.device,
+                    application_device,
+                    pause,
+                    report,
+                )
+                if configured_device != settings.device:
+                    self._state.save(
+                        KnownDevice(
+                            application.topology,
+                            application.usb_serial,
+                            after,
+                            str(configured_device),
+                        )
+                    )
 
             return {
                 "previous_version": before,
                 "installed_version": after,
                 "topology": application.topology,
                 "paused_wmbusmeters_addons": list(pause.addons),
+                "retargeted_wmbusmeters_addons": list(retargeted_wmbusmeters),
+                "device": str(configured_device),
                 "firmware_sha256": image.sha256,
                 "firmware_bytes": image.data_bytes,
             }
@@ -382,16 +426,83 @@ class Cul868Flasher:
 
         return max(self._settings.boot_timeout, _MIN_POST_DFU_TIMEOUT_SECONDS)
 
+    def _migrate_serial_by_id_path(
+        self,
+        previous: Path,
+        application_device: Path,
+        pause: WmbusmetersPause,
+        report: ProgressReporter,
+    ) -> tuple[Path, tuple[str, ...]]:
+        """Retarget a changed firmware-owned by-id alias after final verification.
+
+        The raw application endpoint was found through the already verified USB
+        topology and has answered ``V``. A firmware can legitimately change USB
+        descriptor strings, which changes its udev ``by-id`` name. Migrate only
+        a direct, unique alias; no alias or multiple aliases are unsafe to guess.
+        """
+
+        if previous.parent != Path("/dev/serial/by-id"):
+            return previous, ()
+        try:
+            aliases = self._topology.by_id_paths_for_tty(application_device)
+        except UsbTopologyError as err:
+            pause.leave_stopped_after_error()
+            raise FlashError(
+                "CUL firmware verified, but its serial-by-id path could not be inspected; "
+                "wmbusmeters remains stopped"
+            ) from err
+        if previous in aliases:
+            return previous, ()
+        if len(aliases) != 1:
+            pause.leave_stopped_after_error()
+            if not aliases:
+                reason = "no /dev/serial/by-id alias points to the verified CUL serial endpoint"
+            else:
+                reason = "multiple /dev/serial/by-id aliases point to the verified CUL serial endpoint"
+            raise FlashError(
+                "CUL firmware verified, but its serial-by-id path changed and cannot be migrated "
+                f"safely: {reason}; wmbusmeters remains stopped"
+            )
+
+        current = aliases[0]
+        report(94, "CUL firmware changed its USB descriptor; updating its serial-by-id path.")
+        try:
+            retargeted_wmbusmeters = self._supervisor.retarget_paused_wmbusmeters(
+                pause, previous, current
+            )
+            if not self._supervisor.retarget_own_device_path(previous, current):
+                raise SupervisorError(
+                    "CUL868 flasher device option changed while the flash was in progress"
+                )
+            if not self._replace_configured_device(previous, current):
+                raise SupervisorError(
+                    "CUL868 flasher runtime device path changed while the flash was in progress"
+                )
+        except Exception as err:  # noqa: BLE001
+            pause.leave_stopped_after_error()
+            raise FlashError(
+                "CUL firmware verified, but its serial-by-id path could not be migrated; "
+                "wmbusmeters remains stopped"
+            ) from err
+        if retargeted_wmbusmeters:
+            report(96, "Updated matching wmbusmeters serial-by-id paths.")
+        return current, retargeted_wmbusmeters
+
     def _plan(
         self,
         *,
         manual_recovery: ManualRecoveryTarget | None = None,
         allow_unpaired_recovery: bool = False,
+        settings: Settings | None = None,
     ) -> _FlashPlan:
+        if settings is None:
+            settings = self._settings_snapshot()
         known = self._state.load()
-        known_for_config = known if self._state_matches_configuration(known) else None
+        known_for_config = (
+            known if self._state_matches_configuration(known, settings.device) else None
+        )
         try:
-            application = self._topology.configured_application(self._settings.device)
+            application = self._topology.configured_application(settings.device)
         except UsbTopologyError as application_error:
             if known_for_config is not None:
                 try:
@@ -444,10 +555,11 @@ class Cul868Flasher:
             )
         return _FlashPlan("application", application.topology, application, None, known)
 
-    def _state_matches_configuration(self, known: KnownDevice | None) -> bool:
+    def _state_matches_configuration(self, known: KnownDevice | None, device: Path | None = None) -> bool:
         """Require the exact configured path that originally verified recovery state."""
 
-        return known is not None and known.configured_device == str(self._settings.device)
+        configured_device = device or self._settings_snapshot().device
+        return known is not None and known.configured_device == str(configured_device)
 
     @staticmethod
     def _known_version_for_application(
@@ -596,7 +708,9 @@ class Cul868Flasher:
             else:
                 if bootloader is not None:
                     self._require_expected_usb_serial(
-                        bootloader, expected_usb_serial, "DFU device on the selected USB path"
+                        bootloader,
+                        expected_usb_serial,
+                        "DFU device on the selected USB path",
                     )
                     return bootloader
                 if allow_qemu_topology_change:
@@ -625,6 +739,7 @@ class Cul868Flasher:
         expected_usb_serial: str | None,
         *,
         allow_qemu_topology_change: bool,
+        allow_descriptor_serial_change: bool,
     ) -> tuple[tuple[UsbTarget, Path] | None, str]:
         """Return a current application target and TTY, without waiting.
 
@@ -643,6 +758,7 @@ class Cul868Flasher:
                 application,
                 expected_usb_serial,
                 "CUL868 application on the selected USB path",
+                allow_descriptor_serial_change=allow_descriptor_serial_change,
             )
             return (application, device), ""
         if not allow_qemu_topology_change:
@@ -670,7 +786,8 @@ class Cul868Flasher:
         timeout: float,
         *,
         allow_qemu_topology_change: bool,
-    ) -> tuple[UsbTarget, str]:
+        allow_descriptor_serial_change: bool,
+    ) -> tuple[UsbTarget, Path, str]:
         """Wait for a stable application and its strict CUL identity response.
 
         A CDC node can exist before its firmware is ready to answer commands.
@@ -687,11 +804,12 @@ class Cul868Flasher:
                 topology,
                 expected_usb_serial,
                 allow_qemu_topology_change=allow_qemu_topology_change,
+                allow_descriptor_serial_change=allow_descriptor_serial_change,
             )
             if target is not None:
                 application, device = target
                 try:
-                    return application, self._read_version_once(device)
+                    return application, device, self._read_version_once(device)
                 # A serial adapter can surface platform-specific regular
                 # errors; retry them while the CUL remains in its boot window.
                 except Exception as err:  # noqa: BLE001
@@ -740,12 +858,17 @@ class Cul868Flasher:
 
     @staticmethod
     def _require_expected_usb_serial(
-        target: UsbTarget, expected_usb_serial: str | None, label: str
+        target: UsbTarget,
+        expected_usb_serial: str | None,
+        label: str,
+        *,
+        allow_descriptor_serial_change: bool = False,
     ) -> None:
         if (
             expected_usb_serial is not None
             and target.usb_serial is not None
             and target.usb_serial != expected_usb_serial
+            and not allow_descriptor_serial_change
         ):
             raise FlashError(f"{label} has a different USB serial number")
 
@@ -792,7 +915,11 @@ class Cul868Flasher:
             return serial.version()
 
     def _run_dfu(
-        self, topology: str, expected_usb_serial: str | None, command: str, *arguments: str
+        self,
+        topology: str,
+        expected_usb_serial: str | None,
+        command: str,
+        *arguments: str,
     ) -> None:
         if command not in {"erase", "flash", "start"}:
             raise FlashError("internal error: unsupported DFU command")

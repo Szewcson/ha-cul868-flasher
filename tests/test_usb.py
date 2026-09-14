@@ -86,3 +86,18 @@ class UsbTopologyTests(unittest.TestCase):
         self.assertEqual(len(targets), 1)
         self.assertEqual(targets[0].topology, "2-3")
         self.assertEqual(targets[0].vid_pid, "03eb:2ff4")
+
+    def test_lists_only_by_id_aliases_for_the_verified_tty(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            topology, tty = self._make_tree(root)
+            by_id = root / "dev" / "serial" / "by-id"
+            by_id.mkdir(parents=True)
+            matching = by_id / "usb-busware.de_CUL868-new-if00"
+            matching.symlink_to(Path("../../ttyACM0"))
+            (by_id / "usb-other-radio-if00").symlink_to(Path("../../ttyACM1"))
+            (by_id / "usb-broken-if00").symlink_to(Path("../../ttyACM9"))
+
+            aliases = topology.by_id_paths_for_tty(tty)
+
+        self.assertEqual(aliases, (matching,))

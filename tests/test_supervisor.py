@@ -3,7 +3,12 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 
-from app.supervisor import SupervisorClient, SupervisorError, _wmbusmeters_uses_device
+from app.supervisor import (
+    SupervisorClient,
+    SupervisorError,
+    WmbusmetersPause,
+    _wmbusmeters_uses_device,
+)
 
 
 class _LifecycleSupervisor(SupervisorClient):
@@ -140,3 +145,84 @@ class SupervisorLifecycleTests(unittest.TestCase):
             client.running_wmbusmeters_using_device(Path("/dev/ttyACM0")),
             ("wmbusmeters-ha-addon",),
         )
+
+    def test_retargets_only_exact_paused_by_id_paths_and_own_option(self) -> None:
+        previous = Path("/dev/serial/by-id/usb-busware.de_CUL868-old-if00")
+        current = Path("/dev/serial/by-id/usb-busware.de_CUL868-new-if00")
+
+        class OptionsSupervisor(SupervisorClient):
+            def __init__(self) -> None:
+                self.options: dict[str, dict[str, object]] = {
+                    "self": {"device": str(previous), "baudrate": 9_600},
+                    "a0d7b954_wmbusmeters": {
+                        "conf": {
+                            "device": f"MAIN= {previous} :cul:t1; auto:t1",
+                            "loglevel": "normal",
+                        },
+                        "mqtt": {"username": "not logged"},
+                    },
+                }
+                self.requests: list[tuple[str, str, dict[str, object] | None]] = []
+
+            def _request(
+                self, method: str, path: str, payload: dict[str, object] | None = None
+            ) -> dict[str, object]:
+                self.requests.append((method, path, payload))
+                if method == "GET" and path.endswith("/info"):
+                    slug = path.removeprefix("/addons/").removesuffix("/info")
+                    return {"data": {"options": self.options[slug]}}
+                if method == "POST" and path.endswith("/options"):
+                    slug = path.removeprefix("/addons/").removesuffix("/options")
+                    assert payload is not None
+                    options = payload.get("options")
+                    assert isinstance(options, dict)
+                    self.options[slug] = options
+                    return {"result": "ok"}
+                raise AssertionError(f"unexpected Supervisor request: {method} {path}")
+
+        supervisor = OptionsSupervisor()
+        pause = WmbusmetersPause(("a0d7b954_wmbusmeters",))
+
+        self.assertEqual(
+            supervisor.retarget_paused_wmbusmeters(pause, previous, current),
+            ("a0d7b954_wmbusmeters",),
+        )
+        self.assertTrue(supervisor.retarget_own_device_path(previous, current))
+        self.assertEqual(supervisor.options["self"]["device"], str(current))
+        self.assertEqual(
+            supervisor.options["a0d7b954_wmbusmeters"]["conf"],
+            {
+                "device": f"MAIN= {current} :cul:t1; auto:t1",
+                "loglevel": "normal",
+            },
+        )
+        self.assertEqual(
+            [(method, path) for method, path, _payload in supervisor.requests],
+            [
+                ("GET", "/addons/a0d7b954_wmbusmeters/info"),
+                ("POST", "/addons/a0d7b954_wmbusmeters/options"),
+                ("GET", "/addons/self/info"),
+                ("POST", "/addons/self/options"),
+            ],
+        )
+
+    def test_does_not_overwrite_a_different_own_device_option(self) -> None:
+        previous = Path("/dev/serial/by-id/usb-busware.de_CUL868-old-if00")
+        current = Path("/dev/serial/by-id/usb-busware.de_CUL868-new-if00")
+
+        class ChangedOptionsSupervisor(SupervisorClient):
+            def __init__(self) -> None:
+                self.requests: list[tuple[str, str]] = []
+
+            def _request(
+                self, method: str, path: str, _payload: dict[str, object] | None = None
+            ) -> dict[str, object]:
+                self.requests.append((method, path))
+                if method == "GET":
+                    return {"data": {"options": {"device": "/dev/ttyACM9"}}}
+                raise AssertionError("the changed option must not be overwritten")
+
+        supervisor = ChangedOptionsSupervisor()
+
+        self.assertFalse(supervisor.retarget_own_device_path(previous, current))
+        self.assertEqual(supervisor.requests, [("GET", "/addons/self/info")])

@@ -1,5 +1,5 @@
 name: CUL868 Firmware Flasher
-version: 0.1.10
+version: 0.1.11
 slug: cul868_flasher
 description: Manually flash CUL868 V3 firmware through its USB DFU bootloader
 stage: experimental
@@ -30,6 +30,7 @@ options:
   baudrate: "9600"
   boot_timeout: 90
   qemu_usb_reenumeration_workaround: false
+  additional_cul_addons: []
 schema:
   # Do not use device(subsystem=tty): Supervisor validates that the normal
   # endpoint exists before launch, but it intentionally disappears in DFU.
@@ -42,3 +43,7 @@ schema:
   # Adds a settle window and permits an exact-one fallback when QEMU moves the
   # verified CUL to a different guest USB topology during re-enumeration.
   qemu_usb_reenumeration_workaround: bool
+  # FHEM, Homegear, and similar apps keep their CUL path in private service
+  # files. An explicit opt-in pauses only the named currently running apps.
+  additional_cul_addons:
+    - str

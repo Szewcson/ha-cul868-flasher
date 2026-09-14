@@ -14,6 +14,7 @@ SUPPORTED_BAUDRATES = frozenset({9_600, 19_200, 38_400, 57_600, 115_200})
 DEFAULT_BAUDRATE = 9_600
 DEFAULT_BOOT_TIMEOUT = 90
 DEFAULT_QEMU_USB_REENUMERATION_WORKAROUND = False
+MAX_ADDITIONAL_CUL_ADDONS = 16
 
 
 def _required_string(value: object, name: str) -> str:
@@ -50,6 +51,36 @@ def _device_path(value: object) -> Path:
     return Path(raw)
 
 
+def _additional_cul_addons(value: object) -> tuple[str, ...]:
+    """Validate explicit lifecycle opt-ins for services with private CUL config.
+
+    Supervisor names third-party apps with a lowercase repository prefix and
+    slug. Restrict the option to that syntax so it can never form a path or an
+    arbitrary Supervisor endpoint.
+    """
+
+    if value is None:
+        return ()
+    if not isinstance(value, list) or len(value) > MAX_ADDITIONAL_CUL_ADDONS:
+        raise ValidationError(
+            f"additional_cul_addons must be a list of at most {MAX_ADDITIONAL_CUL_ADDONS} app slugs"
+        )
+    slugs: list[str] = []
+    for value_item in value:
+        if (
+            not isinstance(value_item, str)
+            or not 1 <= len(value_item) <= 128
+            or value_item == "self"
+            or any(
+                character not in "abcdefghijklmnopqrstuvwxyz0123456789_-"
+                for character in value_item
+            )
+        ):
+            raise ValidationError("additional_cul_addons contains an invalid app slug")
+        slugs.append(value_item)
+    return tuple(sorted(set(slugs)))
+
+
 @dataclass(frozen=True)
 class Settings:
     """Runtime settings delivered by Home Assistant Supervisor."""
@@ -58,6 +89,7 @@ class Settings:
     baudrate: int
     boot_timeout: int
     qemu_usb_reenumeration_workaround: bool
+    additional_cul_addons: tuple[str, ...] = ()
 
     @classmethod
     def from_mapping(cls, options: dict[str, object]) -> Settings:
@@ -84,4 +116,5 @@ class Settings:
                 "qemu_usb_reenumeration_workaround",
                 DEFAULT_QEMU_USB_REENUMERATION_WORKAROUND,
             ),
+            additional_cul_addons=_additional_cul_addons(options.get("additional_cul_addons")),
         )

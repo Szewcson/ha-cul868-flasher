@@ -25,3 +25,19 @@ class SettingsTests(unittest.TestCase):
 
         self.assertEqual(DEFAULT_BOOT_TIMEOUT, 90)
         self.assertEqual(settings.boot_timeout, 90)
+
+    def test_accepts_deduplicated_additional_cul_addon_slugs(self) -> None:
+        settings = Settings.from_mapping(
+            {
+                "device": "/dev/ttyACM0",
+                "additional_cul_addons": ["local_homegear", "f591d177_fhem", "local_homegear"],
+            }
+        )
+
+        self.assertEqual(settings.additional_cul_addons, ("f591d177_fhem", "local_homegear"))
+
+    def test_rejects_unsafe_additional_cul_addon_slugs(self) -> None:
+        with self.assertRaisesRegex(ValidationError, "invalid app slug"):
+            Settings.from_mapping(
+                {"device": "/dev/ttyACM0", "additional_cul_addons": ["../homegear"]}
+            )

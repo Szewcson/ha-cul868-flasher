@@ -26,3 +26,12 @@ configuration:
       after a verified bootloader request when QEMU assigns a different guest
       USB port. Enable this only when direct USB passthrough in a QEMU guest is
       unreliable.
+  additional_cul_addons:
+    name: Additional CUL consumer apps
+    description: >-
+      Exact Supervisor app slugs, such as a Homegear or FHEM app that uses this
+      CUL868. The flasher stops only the listed running apps during verification
+      and flashing. Leave empty unless the app owns this same radio. If a
+      firmware changes the serial-by-id name, listed apps remain stopped for
+      you to update their private CUL configuration before restarting them. A
+      remote or standalone service must be stopped manually.

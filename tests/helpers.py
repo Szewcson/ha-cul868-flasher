@@ -7,7 +7,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Self
 
-from app.supervisor import WmbusmetersPause
+from app.supervisor import CulConsumerPause, CulConsumerRetarget
 from app.usb import (
     APPLICATION_PRODUCT_ID,
     APPLICATION_VENDOR_ID,
@@ -135,9 +135,11 @@ class FakeSupervisor:
         self.events: list[str] = []
 
     @contextmanager
-    def temporarily_stop_wmbusmeters(self, _device: Path) -> Iterator[WmbusmetersPause]:
+    def temporarily_stop_cul_consumers(
+        self, _device: Path, _additional_cul_addons: tuple[str, ...]
+    ) -> Iterator[CulConsumerPause]:
         self.events.append("stop")
-        pause = WmbusmetersPause(self.paused)
+        pause = CulConsumerPause(wmbusmeters_addons=self.paused)
         try:
             yield pause
         except BaseException:
@@ -145,7 +147,13 @@ class FakeSupervisor:
                 self.events.append("start")
             raise
         else:
-            self.events.append("start")
+            if pause.addons_to_restore:
+                self.events.append("start")
+
+    def retarget_paused_cul_consumers(
+        self, _pause: CulConsumerPause, _old: Path, _new: Path
+    ) -> CulConsumerRetarget:
+        return CulConsumerRetarget()
 
     def hardware_serial_by_id_paths_for_tty(self, _device: Path) -> tuple[Path, ...]:
         """The default fake has no Supervisor-only alias information."""

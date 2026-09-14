@@ -19,7 +19,7 @@ from .hexfile import HexImage, parse_hex_file
 from .models import Settings
 from .serial import CulSerial
 from .state import DeviceStateStore, KnownDevice
-from .supervisor import SupervisorClient, SupervisorError, WmbusmetersPause
+from .supervisor import CulConsumerPause, CulConsumerRetarget, SupervisorClient, SupervisorError
 from .usb import ManualRecoveryTarget, UsbTarget, UsbTopology, UsbTopologyError
 
 _DFU_EXECUTABLE = "/usr/local/bin/dfu-programmer"
@@ -219,9 +219,9 @@ class Cul868Flasher:
         """Read and persist the normal CUL version without changing firmware.
 
         Startup verification takes the same exclusive serial ownership route as
-        flashing: only matching wmbusmeters instances are paused, and their
-        original lifecycle state is restored by the Supervisor context manager.
-        A bootloader-only device deliberately does not qualify for this probe.
+        flashing: matching known CUL consumers are paused, and their original
+        lifecycle state is restored by the Supervisor context manager. A
+        bootloader-only device deliberately does not qualify for this probe.
         """
 
         with self._flash_lock:
@@ -231,7 +231,9 @@ class Cul868Flasher:
             except UsbTopologyError as err:
                 raise FlashError(f"configured CUL application is unavailable: {err}") from err
             try:
-                with self._supervisor.temporarily_stop_wmbusmeters(settings.device):
+                with self._supervisor.temporarily_stop_cul_consumers(
+                    settings.device, settings.additional_cul_addons
+                ):
                     version = self._read_version(settings.device)
                     self._state.save(
                         KnownDevice(
@@ -266,7 +268,9 @@ class Cul868Flasher:
             report(3, "Resolving the configured CUL868 USB target.")
             plan = self._plan(manual_recovery=manual_recovery, settings=settings)
             allow_qemu_topology_change = settings.qemu_usb_reenumeration_workaround
-            with self._supervisor.temporarily_stop_wmbusmeters(settings.device) as pause:
+            with self._supervisor.temporarily_stop_cul_consumers(
+                settings.device, settings.additional_cul_addons
+            ) as pause:
                 if plan.mode == "application":
                     expected_application_serial = plan.application.usb_serial
                     before = self._enter_bootloader(
@@ -365,7 +369,7 @@ class Cul868Flasher:
                         str(settings.device),
                     )
                 )
-                configured_device, retargeted_wmbusmeters = self._migrate_serial_by_id_path(
+                configured_device, retargeted_consumers = self._migrate_serial_by_id_path(
                     settings.device,
                     application_device,
                     pause,
@@ -385,8 +389,12 @@ class Cul868Flasher:
                 "previous_version": before,
                 "installed_version": after,
                 "topology": application.topology,
-                "paused_wmbusmeters_addons": list(pause.addons),
-                "retargeted_wmbusmeters_addons": list(retargeted_wmbusmeters),
+                "paused_wmbusmeters_addons": list(pause.wmbusmeters_addons),
+                "paused_max2mqtt_addons": list(pause.max2mqtt_addons),
+                "paused_additional_cul_addons": list(pause.additional_addons),
+                "retargeted_wmbusmeters_addons": list(retargeted_consumers.wmbusmeters_addons),
+                "retargeted_max2mqtt_addons": list(retargeted_consumers.max2mqtt_addons),
+                "stopped_additional_cul_addons": list(pause.retained_addons),
                 "device": str(configured_device),
                 "firmware_sha256": image.sha256,
                 "firmware_bytes": image.data_bytes,
@@ -434,9 +442,9 @@ class Cul868Flasher:
         self,
         previous: Path,
         application_device: Path,
-        pause: WmbusmetersPause,
+        pause: CulConsumerPause,
         report: ProgressReporter,
-    ) -> tuple[Path, tuple[str, ...]]:
+    ) -> tuple[Path, CulConsumerRetarget]:
         """Retarget a changed firmware-owned by-id alias after final verification.
 
         The raw application endpoint was found through the already verified USB
@@ -446,7 +454,7 @@ class Cul868Flasher:
         """
 
         if previous.parent != Path("/dev/serial/by-id"):
-            return previous, ()
+            return previous, CulConsumerRetarget()
         try:
             aliases = self._wait_for_serial_by_id_aliases(application_device, report)
         except FlashError:
@@ -455,7 +463,7 @@ class Cul868Flasher:
             )
             raise
         if previous in aliases:
-            return previous, ()
+            return previous, CulConsumerRetarget()
         if len(aliases) != 1:
             pause.leave_stopped_after_error(
                 "the verified CUL serial-by-id path could not be migrated safely"
@@ -466,13 +474,13 @@ class Cul868Flasher:
                 reason = "multiple /dev/serial/by-id aliases point to the verified CUL serial endpoint"
             raise FlashError(
                 "CUL firmware verified, but its serial-by-id path changed and cannot be migrated "
-                f"safely: {reason}; wmbusmeters remains stopped"
+                f"safely: {reason}; CUL consumer add-ons remain stopped"
             )
 
         current = aliases[0]
         report(94, "CUL firmware changed its USB descriptor; updating its serial-by-id path.")
         try:
-            retargeted_wmbusmeters = self._supervisor.retarget_paused_wmbusmeters(
+            retargeted_consumers = self._supervisor.retarget_paused_cul_consumers(
                 pause, previous, current
             )
             if not self._supervisor.retarget_own_device_path(previous, current):
@@ -489,11 +497,14 @@ class Cul868Flasher:
             )
             raise FlashError(
                 "CUL firmware verified, but its serial-by-id path could not be migrated; "
-                "wmbusmeters remains stopped"
+                "CUL consumer add-ons remain stopped"
             ) from err
-        if retargeted_wmbusmeters:
-            report(96, "Updated matching wmbusmeters serial-by-id paths.")
-        return current, retargeted_wmbusmeters
+        if pause.additional_addons:
+            pause.retain_addons(pause.additional_addons)
+            report(96, "Known app paths were updated; additional CUL apps remain stopped.")
+        elif retargeted_consumers.addons:
+            report(96, "Updated matching CUL consumer serial-by-id paths.")
+        return current, retargeted_consumers
 
     def _wait_for_serial_by_id_aliases(
         self, application_device: Path, report: ProgressReporter

@@ -1,4 +1,4 @@
-"""Narrow Home Assistant Supervisor lifecycle support for wmbusmeters."""
+"""Narrow Home Assistant Supervisor lifecycle support for CUL consumers."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import json
 import os
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from time import monotonic, sleep
 from typing import Any
@@ -18,6 +18,8 @@ _MAX_RESPONSE_BYTES = 256 * 1024
 _REQUEST_TIMEOUT_SECONDS = 15
 _STATE_TIMEOUT_SECONDS = 30
 _RESTORE_ATTEMPTS = 3
+_ADDON_STATES = frozenset({"started", "stopped", "error"})
+_QUIESCENT_ADDON_STATES = frozenset({"stopped", "error"})
 
 
 class SupervisorError(RuntimeError):
@@ -25,15 +27,26 @@ class SupervisorError(RuntimeError):
 
 
 @dataclass
-class WmbusmetersPause:
-    """The stopped instances and the safe lifecycle decision for one flash."""
+class CulConsumerPause:
+    """Stopped known CUL consumers and the safe lifecycle decision for one flash."""
 
-    addons: tuple[str, ...]
+    wmbusmeters_addons: tuple[str, ...] = ()
+    max2mqtt_addons: tuple[str, ...] = ()
+    additional_addons: tuple[str, ...] = ()
     _restore_after_error: bool = True
     _leave_stopped_reason: str = "the CUL firmware did not verify"
+    _retained_addons: set[str] = field(default_factory=set)
+
+    @property
+    def addons(self) -> tuple[str, ...]:
+        """Return all consumers in the deterministic stop/restore order."""
+
+        return tuple(
+            sorted(set(self.wmbusmeters_addons + self.max2mqtt_addons + self.additional_addons))
+        )
 
     def leave_stopped_after_error(self, reason: str = "the CUL firmware did not verify") -> None:
-        """Keep a reader stopped when reopening the CUL is not yet safe."""
+        """Keep every paused consumer stopped when reopening the CUL is unsafe."""
 
         self._restore_after_error = False
         self._leave_stopped_reason = reason
@@ -44,9 +57,44 @@ class WmbusmetersPause:
 
     @property
     def leave_stopped_reason(self) -> str:
-        """Return the operator-facing reason that a paused reader remains stopped."""
+        """Return the operator-facing reason that paused consumers remain stopped."""
 
         return self._leave_stopped_reason
+
+    def retain_addons(self, addons: tuple[str, ...]) -> None:
+        """Keep named paused consumers stopped after an otherwise successful flash.
+
+        User-named external applications have no stable Supervisor schema for
+        their CUL path. When a firmware changes a serial-by-id alias, restarting
+        one could reopen a stale endpoint, so retain it for an operator review.
+        """
+
+        self._retained_addons.update(set(addons).intersection(self.addons))
+
+    @property
+    def addons_to_restore(self) -> tuple[str, ...]:
+        """Return paused consumers that are safe to restart."""
+
+        return tuple(slug for slug in self.addons if slug not in self._retained_addons)
+
+    @property
+    def retained_addons(self) -> tuple[str, ...]:
+        """Return paused consumers deliberately left stopped after success."""
+
+        return tuple(sorted(self._retained_addons))
+
+@dataclass(frozen=True)
+class CulConsumerRetarget:
+    """Known consumer settings changed after a verified alias migration."""
+
+    wmbusmeters_addons: tuple[str, ...] = ()
+    max2mqtt_addons: tuple[str, ...] = ()
+
+    @property
+    def addons(self) -> tuple[str, ...]:
+        """Return every consumer whose exact path was migrated."""
+
+        return tuple(sorted(set(self.wmbusmeters_addons + self.max2mqtt_addons)))
 
 
 class SupervisorClient:
@@ -67,14 +115,16 @@ class SupervisorClient:
             os.environ.get("SUPERVISOR_TOKEN", ""),
         )
 
-    def running_wmbusmeters_using_device(self, device: Path) -> tuple[str, ...]:
-        """Return started wmbusmeters apps configured to access ``device``.
+    def running_cul_consumers_using_device(
+        self, device: Path, additional_cul_addons: tuple[str, ...]
+    ) -> CulConsumerPause:
+        """Return started, safely identifiable consumers of ``device``.
 
-        The Supervisor intentionally exposes app options to a ``manager`` app.
-        Read only the wmbusmeters device setting, never log or retain its
-        options, which can include MQTT credentials. ``auto`` and ``cul`` are
-        also treated as matches because those discovery modes can probe CUL
-        serial devices even without naming this one by path.
+        ``wmbusmeters`` and ``max2mqtt`` are recognized only through their
+        documented serial options. Additional app slugs are an explicit
+        operator opt-in for services such as FHEM or Homegear, whose CUL path
+        is normally stored in private service files rather than Supervisor
+        options. Only their state is read; their options are not inspected.
         """
 
         document = self._request("GET", "/addons")
@@ -82,23 +132,38 @@ class SupervisorClient:
         addons = data.get("addons")
         if not isinstance(addons, list):
             raise SupervisorError("Supervisor returned an invalid add-on list")
-        slugs: list[str] = []
+        additional = {slug for slug in additional_cul_addons if _is_addon_slug(slug)}
+        wmbusmeters: list[str] = []
+        max2mqtt: list[str] = []
+        opted_in: list[str] = []
         for addon in addons:
             if not isinstance(addon, dict):
                 continue
             slug = addon.get("slug")
             if _is_wmbusmeters_slug(slug):
                 info = self._addon_info(slug)
-                if info.get("state") != "started":
-                    continue
-                if _wmbusmeters_uses_device(info.get("options"), device):
-                    slugs.append(slug)
-        return tuple(sorted(set(slugs)))
+                if info.get("state") == "started" and _wmbusmeters_uses_device(
+                    info.get("options"), device
+                ):
+                    wmbusmeters.append(slug)
+            elif _is_max2mqtt_slug(slug):
+                info = self._addon_info(slug)
+                if info.get("state") == "started" and _max2mqtt_uses_device(
+                    info.get("options"), device
+                ):
+                    max2mqtt.append(slug)
+            elif isinstance(slug, str) and slug in additional and addon.get("state") == "started":
+                opted_in.append(slug)
+        return CulConsumerPause(
+            wmbusmeters_addons=tuple(sorted(set(wmbusmeters))),
+            max2mqtt_addons=tuple(sorted(set(max2mqtt))),
+            additional_addons=tuple(sorted(set(opted_in))),
+        )
 
     def addon_state(self, slug: str) -> str:
         data = self._addon_info(slug)
         state = data.get("state")
-        if not isinstance(state, str) or state not in {"started", "stopped"}:
+        if not isinstance(state, str) or state not in _ADDON_STATES:
             raise SupervisorError(f"Supervisor returned an invalid state for {slug}")
         return state
 
@@ -139,7 +204,12 @@ class SupervisorClient:
         last_state = "unknown"
         while monotonic() < deadline:
             last_state = self.addon_state(slug)
-            if last_state == expected:
+            if last_state == expected or (
+                expected == "stopped" and last_state in _QUIESCENT_ADDON_STATES
+            ):
+                # Supervisor can report ``error`` after an explicit SIGTERM
+                # even though the container has exited. It is safe to proceed
+                # only because this context manager issued the stop request.
                 return
             sleep(0.5)
         raise SupervisorError(
@@ -164,10 +234,10 @@ class SupervisorClient:
         self._set_addon_options("self", updated)
         return True
 
-    def retarget_paused_wmbusmeters(
-        self, pause: WmbusmetersPause, previous: Path, current: Path
-    ) -> tuple[str, ...]:
-        """Retarget only paused readers that still name the old direct by-id path.
+    def retarget_paused_cul_consumers(
+        self, pause: CulConsumerPause, previous: Path, current: Path
+    ) -> CulConsumerRetarget:
+        """Retarget known paused consumers that still name the old by-id path.
 
         The options documents can contain credentials. They stay in memory only
         long enough to replace the one exact serial endpoint and are never logged.
@@ -175,29 +245,43 @@ class SupervisorClient:
 
         _require_serial_by_id_path(previous)
         _require_serial_by_id_path(current)
-        updated_slugs: list[str] = []
-        for slug in pause.addons:
+        updated_wmbusmeters: list[str] = []
+        for slug in pause.wmbusmeters_addons:
             options = self._addon_options(slug)
             updated = _retarget_wmbusmeters_options(options, previous, current)
             if updated is None:
                 continue
             self._set_addon_options(slug, updated)
-            updated_slugs.append(slug)
-        return tuple(updated_slugs)
+            updated_wmbusmeters.append(slug)
+        updated_max2mqtt: list[str] = []
+        for slug in pause.max2mqtt_addons:
+            options = self._addon_options(slug)
+            updated = _retarget_max2mqtt_options(options, previous, current)
+            if updated is None:
+                continue
+            self._set_addon_options(slug, updated)
+            updated_max2mqtt.append(slug)
+        return CulConsumerRetarget(
+            wmbusmeters_addons=tuple(updated_wmbusmeters),
+            max2mqtt_addons=tuple(updated_max2mqtt),
+        )
 
     @contextmanager
-    def temporarily_stop_wmbusmeters(self, device: Path) -> Iterator[WmbusmetersPause]:
-        """Pause matching active wmbusmeters instances and restore only those.
+    def temporarily_stop_cul_consumers(
+        self, device: Path, additional_cul_addons: tuple[str, ...]
+    ) -> Iterator[CulConsumerPause]:
+        """Pause matching CUL consumers and restore only those.
 
         This forms a transaction around raw serial/USB access. A failed flash
-        before DFU begins restores a previously running meter reader. Once the
-        CUL may be in DFU or have unverified firmware, the caller can retain
-        the stopped state until the operator has repaired the radio.
+        before DFU begins restores a previously running consumer. Once the CUL
+        may be in DFU or have unverified firmware, the caller can retain the
+        stopped state until the operator has repaired the radio.
         """
 
+        matches = self.running_cul_consumers_using_device(device, additional_cul_addons)
         stopped: list[str] = []
         try:
-            for slug in self.running_wmbusmeters_using_device(device):
+            for slug in matches.addons:
                 self.stop_addon(slug)
                 # A stop request can take effect just before a following poll
                 # fails. Record it first so the error path still restores it.
@@ -207,21 +291,26 @@ class SupervisorClient:
             _add_restore_note(err, self._restore(stopped))
             raise
 
-        pause = WmbusmetersPause(tuple(stopped))
+        stopped_set = set(stopped)
+        pause = CulConsumerPause(
+            wmbusmeters_addons=tuple(
+                slug for slug in matches.wmbusmeters_addons if slug in stopped_set
+            ),
+            max2mqtt_addons=tuple(slug for slug in matches.max2mqtt_addons if slug in stopped_set),
+            additional_addons=tuple(slug for slug in matches.additional_addons if slug in stopped_set),
+        )
         try:
             yield pause
         except BaseException as err:
             if pause.restore_after_error:
-                _add_restore_note(err, self._restore(stopped))
+                _add_restore_note(err, self._restore(list(pause.addons_to_restore)))
             elif stopped:
-                err.add_note(
-                    "wmbusmeters remains stopped because " + pause.leave_stopped_reason
-                )
+                err.add_note("CUL consumer add-ons remain stopped because " + pause.leave_stopped_reason)
             raise
         else:
-            failures = self._restore(stopped)
+            failures = self._restore(list(pause.addons_to_restore))
             if failures:
-                raise SupervisorError("could not restore wmbusmeters: " + "; ".join(failures))
+                raise SupervisorError("could not restore CUL consumer add-ons: " + "; ".join(failures))
 
     def _restore(self, slugs: list[str]) -> list[str]:
         failures: list[str] = []
@@ -311,6 +400,26 @@ def _is_wmbusmeters_slug(value: object) -> bool:
     } or lowered.endswith(("_wmbusmeters", "_wmbusmeters-ha-addon", "_wmbusmeters-ha-addon-edge"))
 
 
+def _is_max2mqtt_slug(value: object) -> bool:
+    """Recognize the maintained MAX! to MQTT Bridge add-on slug.
+
+    Home Assistant prefixes third-party app slugs with a repository hash, so
+    accept the documented bare slug and the Supervisor-generated suffix form.
+    """
+
+    return isinstance(value, str) and (
+        value.lower() == "max2mqtt" or value.lower().endswith("_max2mqtt")
+    )
+
+
+def _is_addon_slug(value: object) -> bool:
+    """Validate a Supervisor app slug before it can be used for lifecycle calls."""
+
+    if not isinstance(value, str) or not 1 <= len(value) <= 128 or value == "self":
+        return False
+    return all(character in "abcdefghijklmnopqrstuvwxyz0123456789_-" for character in value)
+
+
 def _wmbusmeters_uses_device(options: object, selected_device: Path) -> bool:
     """Identify only direct CUL paths and documented serial discovery modes."""
 
@@ -344,6 +453,15 @@ def _wmbusmeters_device_spec_uses_device(specification: str, selected_device: Pa
     if endpoint.lower() in {"auto", "cul"}:
         return True
     return _same_device_path(endpoint, selected_device)
+
+
+def _max2mqtt_uses_device(options: object, selected_device: Path) -> bool:
+    """Match MAX! to MQTT Bridge's documented direct ``serial_port`` option."""
+
+    if not isinstance(options, dict):
+        return False
+    serial_port = options.get("serial_port")
+    return isinstance(serial_port, str) and _same_device_path(serial_port, selected_device)
 
 
 def _same_device_path(candidate: str, selected_device: Path) -> bool:
@@ -423,9 +541,23 @@ def _retarget_wmbusmeters_device_spec(specification: str, previous: Path, curren
     return f"{prefix}{leading}{current}{trailing}{suffix_separator}{suffix}"
 
 
+def _retarget_max2mqtt_options(
+    options: object, previous: Path, current: Path
+) -> dict[str, Any] | None:
+    """Copy MAX! to MQTT Bridge options while replacing only its exact port."""
+
+    if not isinstance(options, dict):
+        raise SupervisorError("max2mqtt returned invalid options")
+    if options.get("serial_port") != str(previous):
+        return None
+    updated = dict(options)
+    updated["serial_port"] = str(current)
+    return updated
+
+
 def _quote_slug(slug: str) -> str:
-    if not _is_wmbusmeters_slug(slug):
-        raise SupervisorError("refusing to control an add-on other than wmbusmeters")
+    if not _is_addon_slug(slug):
+        raise SupervisorError("refusing to control an add-on with an invalid slug")
     return quote(slug, safe="_-")
 
 
@@ -470,4 +602,4 @@ def _require_mapping(value: object, label: str) -> dict[str, Any]:
 
 def _add_restore_note(error: BaseException, failures: list[str]) -> None:
     if failures:
-        error.add_note("wmbusmeters could not be restored: " + "; ".join(failures))
+        error.add_note("CUL consumer add-ons could not be restored: " + "; ".join(failures))

@@ -72,9 +72,17 @@ def run() -> None:
             else:
                 installed = result.get("installed_version")
                 LOGGER.info("Verified CUL868 firmware: %s", installed)
+                retained = result.get("stopped_additional_cul_addons")
+                if isinstance(retained, list) and all(isinstance(slug, str) for slug in retained):
+                    retained_message = (
+                        "; additional CUL apps remain stopped for a manual serial-path review: "
+                        + ", ".join(retained)
+                    )
+                else:
+                    retained_message = ""
                 controller.complete(
                     operation_id,
-                    f"CUL868 firmware verified: {installed or 'version unavailable'}",
+                    f"CUL868 firmware verified: {installed or 'version unavailable'}{retained_message}",
                 )
             finally:
                 api.discard_image(operation.image)

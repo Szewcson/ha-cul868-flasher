@@ -35,10 +35,10 @@ as the sole identity check.
    such as `/dev/serial/by-id/...`. Do not choose a bootloader device. Keep
    this saved path unchanged if the normal TTY disappears during DFU recovery.
 3. Start the add-on and open its Ingress page.
-   At startup it briefly pauses a matching wmbusmeters instance to read and
-   record the CUL's `V` version response, then restores wmbusmeters. An
-   unavailable CUL or failed read is reported in the add-on log but does not
-   prevent the flasher from starting.
+   At startup it briefly pauses matching known CUL consumers to read and
+   record the CUL's `V` version response, then restores them. An unavailable
+   CUL or failed read is reported in the add-on log but does not prevent the
+   flasher from starting.
 4. Choose a firmware `.hex` file, then select **Validate firmware**.
 5. Review the SHA-256, application address range, and USB preflight result.
 6. Tick the explicit overwrite confirmation and select **Flash CUL868 V3**.
@@ -101,7 +101,7 @@ not caught up, it also reads the canonical `by_id` value for that exact
 `dev_path` from the Supervisor [hardware inventory API](https://developers.home-assistant.io/docs/api/supervisor/endpoints/#get-hardwareinfo).
 If the configured path is a direct `/dev/serial/by-id/...` alias, its old
 alias disappeared, and exactly one new alias exists, the add-on updates its
-own option and the exact direct path in any wmbusmeters instances it paused
+own option and the exact direct path in any supported CUL consumers it paused
 for this flash. The running process also uses the new path for a later
 operation without requiring a restart.
 
@@ -109,31 +109,53 @@ The migration deliberately refuses to guess when no alias or more than one
 alias resolves to the verified endpoint, or when the add-on option no longer
 contains the expected old path when it is checked. In that case the firmware is
 still verified, but its configuration migration needs attention and matching
-wmbusmeters instances remain stopped until the path is resolved manually.
-`auto`, `cul`, raw `/dev/ttyACM*`, and unrelated wmbusmeters configurations
-are never rewritten. Avoid editing either add-on's device option during a
-flash: the Supervisor options API does not provide an atomic compare-and-set
-update.
+CUL consumers remain stopped until the path is resolved manually. `auto`,
+`cul`, raw `/dev/ttyACM*`, and unrelated configurations are never rewritten.
+Avoid editing any consumer's device option during a flash: the Supervisor
+options API does not provide an atomic compare-and-set update.
 
-## wmbusmeters coordination
+## CUL consumer coordination
 
-Before a startup version read or a flash, the add-on reads only the `device`
-setting from each recognized running wmbusmeters add-on's Supervisor-provided
-options. It pauses and restores exactly the instances configured with the
-selected CUL path, including an equivalent resolved `/dev` path. It also pauses
-`auto` and `cul` discovery modes because they can probe the selected serial
-radio. Other wmbusmeters instances remain running. Following a verified,
-unambiguous serial-by-id migration, it updates only the exact path values for
-the instances it paused. The implementation neither logs nor stores the
-options, which may contain MQTT credentials.
+Before a startup version read or a flash, the add-on discovers these direct
+CUL consumers from their documented Supervisor option schemas:
 
-A startup version check or a flash that fails before DFU begins restores those
-instances. Once the add-on requests `B01`, or begins bootloader-only recovery,
-it leaves matching wmbusmeters instances stopped if DFU or final `V`
-verification fails. This prevents a meter reader from reopening a radio with
-unknown firmware. They are restored automatically only after the CUL application
-has returned and answered `V`; after a failed update, repair the radio first and
-then start wmbusmeters manually.
+- [wmbusmeters](https://github.com/wmbusmeters/wmbusmeters-ha-addon): the
+  `device` setting, including `auto` and `cul` discovery modes that can probe
+  the selected serial radio.
+- [MAX! to MQTT Bridge (`max2mqtt`)](https://github.com/pwurbs/max2mqtt): the
+  exact `serial_port` setting for the selected CUL.
+
+It pauses and restores only matching, currently running instances. Following a
+verified, unambiguous serial-by-id migration, it updates only their exact old
+path values. The implementation neither logs nor stores the options, which may
+contain MQTT credentials.
+
+FHEM and Homegear can also own a CUL, but the normal [Home Assistant Homematic
+integration](https://www.home-assistant.io/integrations/homematic/) talks to
+those services over XML-RPC rather than opening the CUL itself. Their CUL paths
+usually live in service-private configuration files, so the flasher cannot
+safely infer one from the public Supervisor or Core APIs.
+For a known FHEM, Homegear, or similar serial bridge app, add its exact
+Supervisor slug to **Additional CUL consumer apps**. Find the slug with
+`ha addons list` in the Home Assistant Terminal/SSH app. The flasher then
+pauses only that running app for verification and flashing. If a firmware
+changes the serial-by-id name, explicitly configured apps remain stopped after
+an otherwise successful flash; update their own CUL path and restart them
+manually. This coordinates only Home Assistant apps: a remote or standalone
+FHEM/Homegear server must be stopped manually before flashing.
+
+Custom Core integrations such as MaxCUL, Node-RED flows, and non-add-on
+serial-to-MQTT bridges cannot be discovered or stopped safely from an app.
+Stop them manually before flashing. The add-on deliberately does not grant
+itself `homeassistant_api` access or restart Home Assistant Core just to try.
+
+A startup version check or a flash that fails before DFU begins restores paused
+consumers. Once the add-on requests `B01`, or begins bootloader-only recovery,
+it leaves them stopped if DFU or final `V` verification fails. This prevents a
+reader from reopening a radio with unknown firmware. They are restored
+automatically only after the CUL application has returned and answered `V`;
+after a failed update, repair the radio first and then start the affected apps
+manually.
 
 ## Virtual machines and USB re-enumeration
 
@@ -187,8 +209,8 @@ personalities must still be visible to Home Assistant.
   network permission. The Python process has no raw USB device-node access.
 
 The add-on requests Home Assistant's `manager` role only because the Supervisor
-requires it to read/update an add-on's exact device option and to stop/start a
-matching wmbusmeters app around a flash. The role grants broader Supervisor
+requires it to read/update exact known consumer device options and to stop/start
+matching CUL consumer apps around a flash. The role grants broader Supervisor
 authority than this implementation uses, so install it only from a trusted
 repository.
 The relevant option and lifecycle endpoints are documented in the [Home

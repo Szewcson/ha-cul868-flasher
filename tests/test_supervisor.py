@@ -4,9 +4,10 @@ import unittest
 from pathlib import Path
 
 from app.supervisor import (
+    CulConsumerPause,
     SupervisorClient,
     SupervisorError,
-    WmbusmetersPause,
+    _max2mqtt_uses_device,
     _wmbusmeters_uses_device,
 )
 
@@ -17,8 +18,12 @@ class _LifecycleSupervisor(SupervisorClient):
         self.fail_stop_wait_once = fail_stop_wait_once
         self.events: list[str] = []
 
-    def running_wmbusmeters_using_device(self, _device: Path) -> tuple[str, ...]:
-        return ("a0d7b954_wmbusmeters",) if self.started else ()
+    def running_cul_consumers_using_device(
+        self, _device: Path, _additional_cul_addons: tuple[str, ...]
+    ) -> CulConsumerPause:
+        return CulConsumerPause(
+            wmbusmeters_addons=("a0d7b954_wmbusmeters",) if self.started else ()
+        )
 
     def addon_state(self, _slug: str) -> str:
         return "started" if self.started else "stopped"
@@ -42,7 +47,7 @@ class _LifecycleSupervisor(SupervisorClient):
 class SupervisorLifecycleTests(unittest.TestCase):
     def test_restores_only_addon_that_was_initially_running(self) -> None:
         supervisor = _LifecycleSupervisor()
-        with supervisor.temporarily_stop_wmbusmeters(Path("/dev/ttyACM0")) as pause:
+        with supervisor.temporarily_stop_cul_consumers(Path("/dev/ttyACM0"), ()) as pause:
             self.assertEqual(pause.addons, ("a0d7b954_wmbusmeters",))
             self.assertFalse(supervisor.started)
 
@@ -56,7 +61,7 @@ class SupervisorLifecycleTests(unittest.TestCase):
         supervisor = _LifecycleSupervisor(fail_stop_wait_once=True)
         with (
             self.assertRaisesRegex(SupervisorError, "simulated polling failure"),
-            supervisor.temporarily_stop_wmbusmeters(Path("/dev/ttyACM0")),
+            supervisor.temporarily_stop_cul_consumers(Path("/dev/ttyACM0"), ()),
         ):
             self.fail("context must not yield after the stop poll failed")
 
@@ -68,24 +73,81 @@ class SupervisorLifecycleTests(unittest.TestCase):
 
     def test_leaves_previously_stopped_addon_stopped(self) -> None:
         supervisor = _LifecycleSupervisor(initially_started=False)
-        with supervisor.temporarily_stop_wmbusmeters(Path("/dev/ttyACM0")) as pause:
+        with supervisor.temporarily_stop_cul_consumers(Path("/dev/ttyACM0"), ()) as pause:
             self.assertEqual(pause.addons, ())
 
         self.assertFalse(supervisor.started)
         self.assertEqual(supervisor.events, [])
 
+    def test_accepts_supervisor_error_after_an_explicit_stop(self) -> None:
+        class ErrorAfterStopSupervisor(SupervisorClient):
+            def addon_state(self, _slug: str) -> str:
+                return "error"
+
+        supervisor = ErrorAfterStopSupervisor.__new__(ErrorAfterStopSupervisor)
+
+        supervisor.wait_for_state("local_homegear", "stopped")
+
     def test_leaves_matching_addon_stopped_after_an_uncertain_dfu_failure(self) -> None:
         supervisor = _LifecycleSupervisor()
         with (
             self.assertRaisesRegex(RuntimeError, "DFU did not verify") as caught,
-            supervisor.temporarily_stop_wmbusmeters(Path("/dev/ttyACM0")) as pause,
+            supervisor.temporarily_stop_cul_consumers(Path("/dev/ttyACM0"), ()) as pause,
         ):
             pause.leave_stopped_after_error()
             raise RuntimeError("DFU did not verify")
 
         self.assertFalse(supervisor.started)
         self.assertEqual(supervisor.events, ["stop:a0d7b954_wmbusmeters"])
-        self.assertIn("wmbusmeters remains stopped", "\n".join(caught.exception.__notes__))
+        self.assertIn("CUL consumer add-ons remain stopped", "\n".join(caught.exception.__notes__))
+
+    def test_retains_only_opted_in_external_app_after_alias_migration(self) -> None:
+        class MultiConsumerSupervisor(SupervisorClient):
+            def __init__(self) -> None:
+                self.states = {
+                    "a0d7b954_wmbusmeters": "started",
+                    "local_homegear": "started",
+                }
+                self.events: list[str] = []
+
+            def running_cul_consumers_using_device(
+                self, _device: Path, _additional_cul_addons: tuple[str, ...]
+            ) -> CulConsumerPause:
+                return CulConsumerPause(
+                    wmbusmeters_addons=("a0d7b954_wmbusmeters",),
+                    additional_addons=("local_homegear",),
+                )
+
+            def addon_state(self, slug: str) -> str:
+                return self.states[slug]
+
+            def stop_addon(self, slug: str) -> None:
+                self.events.append(f"stop:{slug}")
+                self.states[slug] = "stopped"
+
+            def start_addon(self, slug: str) -> None:
+                self.events.append(f"start:{slug}")
+                self.states[slug] = "started"
+
+            def wait_for_state(self, slug: str, expected: str) -> None:
+                if self.states[slug] != expected:
+                    raise AssertionError(f"unexpected simulated state for {slug}")
+
+        supervisor = MultiConsumerSupervisor()
+        with supervisor.temporarily_stop_cul_consumers(
+            Path("/dev/ttyACM0"), ("local_homegear",)
+        ) as pause:
+            pause.retain_addons(pause.additional_addons)
+
+        self.assertEqual(
+            supervisor.events,
+            [
+                "stop:a0d7b954_wmbusmeters",
+                "stop:local_homegear",
+                "start:a0d7b954_wmbusmeters",
+            ],
+        )
+        self.assertEqual(supervisor.states["local_homegear"], "stopped")
 
     def test_matches_only_direct_path_and_serial_discovery_modes(self) -> None:
         device = Path("/dev/serial/by-id/cul868")
@@ -108,8 +170,10 @@ class SupervisorLifecycleTests(unittest.TestCase):
         self.assertFalse(
             _wmbusmeters_uses_device({"conf": {"device": "rtlwmbus:t1"}}, device)
         )
+        self.assertTrue(_max2mqtt_uses_device({"serial_port": str(device)}, device))
+        self.assertFalse(_max2mqtt_uses_device({"serial_port": "/dev/ttyACM9"}, device))
 
-    def test_selects_only_started_matching_official_addon(self) -> None:
+    def test_selects_only_started_matching_known_and_opted_in_addons(self) -> None:
         class OptionsSupervisor(SupervisorClient):
             def _request(self, method: str, path: str) -> dict[str, object]:
                 if method != "GET":
@@ -120,7 +184,10 @@ class SupervisorLifecycleTests(unittest.TestCase):
                             "addons": [
                                 {"slug": "wmbusmeters-ha-addon"},
                                 {"slug": "wmbusmeters-ha-addon-edge"},
-                                {"slug": "unrelated"},
+                                {"slug": "f591d177_max2mqtt"},
+                                {"slug": "local_homegear", "state": "started"},
+                                {"slug": "unrelated", "state": "started"},
+                                {"slug": ["malformed"]},
                             ]
                         }
                     }
@@ -138,12 +205,25 @@ class SupervisorLifecycleTests(unittest.TestCase):
                             "options": {"conf": {"device": "auto:t1"}},
                         }
                     }
+                if path == "/addons/f591d177_max2mqtt/info":
+                    return {
+                        "data": {
+                            "state": "started",
+                            "options": {"serial_port": "/dev/ttyACM0"},
+                        }
+                    }
                 raise AssertionError(f"unexpected Supervisor request: {path}")
 
         client = OptionsSupervisor.__new__(OptionsSupervisor)
         self.assertEqual(
-            client.running_wmbusmeters_using_device(Path("/dev/ttyACM0")),
-            ("wmbusmeters-ha-addon",),
+            client.running_cul_consumers_using_device(
+                Path("/dev/ttyACM0"), ("local_homegear",)
+            ),
+            CulConsumerPause(
+                wmbusmeters_addons=("wmbusmeters-ha-addon",),
+                max2mqtt_addons=("f591d177_max2mqtt",),
+                additional_addons=("local_homegear",),
+            ),
         )
 
     def test_reads_only_canonical_by_id_paths_from_matching_hardware_records(self) -> None:
@@ -194,6 +274,10 @@ class SupervisorLifecycleTests(unittest.TestCase):
                         },
                         "mqtt": {"username": "not logged"},
                     },
+                    "f591d177_max2mqtt": {
+                        "serial_port": str(previous),
+                        "mqtt_password": "not logged",
+                    },
                 }
                 self.requests: list[tuple[str, str, dict[str, object] | None]] = []
 
@@ -214,12 +298,17 @@ class SupervisorLifecycleTests(unittest.TestCase):
                 raise AssertionError(f"unexpected Supervisor request: {method} {path}")
 
         supervisor = OptionsSupervisor()
-        pause = WmbusmetersPause(("a0d7b954_wmbusmeters",))
+        pause = CulConsumerPause(
+            wmbusmeters_addons=("a0d7b954_wmbusmeters",),
+            max2mqtt_addons=("f591d177_max2mqtt",),
+        )
 
+        retargeted = supervisor.retarget_paused_cul_consumers(pause, previous, current)
         self.assertEqual(
-            supervisor.retarget_paused_wmbusmeters(pause, previous, current),
+            retargeted.wmbusmeters_addons,
             ("a0d7b954_wmbusmeters",),
         )
+        self.assertEqual(retargeted.max2mqtt_addons, ("f591d177_max2mqtt",))
         self.assertTrue(supervisor.retarget_own_device_path(previous, current))
         self.assertEqual(supervisor.options["self"]["device"], str(current))
         self.assertEqual(
@@ -229,11 +318,14 @@ class SupervisorLifecycleTests(unittest.TestCase):
                 "loglevel": "normal",
             },
         )
+        self.assertEqual(supervisor.options["f591d177_max2mqtt"]["serial_port"], str(current))
         self.assertEqual(
             [(method, path) for method, path, _payload in supervisor.requests],
             [
                 ("GET", "/addons/a0d7b954_wmbusmeters/info"),
                 ("POST", "/addons/a0d7b954_wmbusmeters/options"),
+                ("GET", "/addons/f591d177_max2mqtt/info"),
+                ("POST", "/addons/f591d177_max2mqtt/options"),
                 ("GET", "/addons/self/info"),
                 ("POST", "/addons/self/options"),
             ],

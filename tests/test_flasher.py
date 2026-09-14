@@ -9,7 +9,7 @@ from app.flasher import Cul868Flasher, FlashError
 from app.hexfile import parse_hex_file
 from app.models import Settings
 from app.state import DeviceStateStore, KnownDevice
-from app.supervisor import WmbusmetersPause
+from app.supervisor import CulConsumerPause, CulConsumerRetarget
 
 from .helpers import FakeSerialFactory, FakeSupervisor, FakeTopology, minimal_hex, target
 
@@ -714,11 +714,11 @@ class FlasherTests(unittest.TestCase):
                             self.wmbus_retargets: list[tuple[Path, Path]] = []
                             self.own_retargets: list[tuple[Path, Path]] = []
 
-                        def retarget_paused_wmbusmeters(
+                        def retarget_paused_cul_consumers(
                             self, _pause: object, old: Path, new: Path
-                        ) -> tuple[str, ...]:
+                        ) -> CulConsumerRetarget:
                             self.wmbus_retargets.append((old, new))
-                            return ("wmbusmeters",)
+                            return CulConsumerRetarget(wmbusmeters_addons=("wmbusmeters",))
 
                         def retarget_own_device_path(self, old: Path, new: Path) -> bool:
                             self.own_retargets.append((old, new))
@@ -787,11 +787,11 @@ class FlasherTests(unittest.TestCase):
                     self.hardware_queries.append(device)
                     return (current,)
 
-                def retarget_paused_wmbusmeters(
+                def retarget_paused_cul_consumers(
                     self, _pause: object, old: Path, new: Path
-                ) -> tuple[str, ...]:
+                ) -> CulConsumerRetarget:
                     self.wmbus_retargets.append((old, new))
-                    return ("wmbusmeters",)
+                    return CulConsumerRetarget(wmbusmeters_addons=("wmbusmeters",))
 
                 def retarget_own_device_path(self, old: Path, new: Path) -> bool:
                     self.own_retargets.append((old, new))
@@ -911,7 +911,7 @@ class FlasherTests(unittest.TestCase):
         finally:
             path.unlink(missing_ok=True)
 
-    def test_serial_by_id_migration_failure_keeps_wmbusmeters_paused(self) -> None:
+    def test_serial_by_id_migration_failure_keeps_cul_consumers_paused(self) -> None:
         previous = Path("/dev/serial/by-id/usb-busware.de_CUL868-old-if00")
         current = Path("/dev/serial/by-id/usb-busware.de_CUL868-new-if00")
 
@@ -920,9 +920,9 @@ class FlasherTests(unittest.TestCase):
                 return (current,)
 
         class FailingSupervisor(FakeSupervisor):
-            def retarget_paused_wmbusmeters(
+            def retarget_paused_cul_consumers(
                 self, _pause: object, _old: Path, _new: Path
-            ) -> tuple[str, ...]:
+            ) -> CulConsumerRetarget:
                 raise RuntimeError("simulated Supervisor transport failure")
 
         supervisor = FailingSupervisor()
@@ -931,7 +931,7 @@ class FlasherTests(unittest.TestCase):
             topology=OneAliasTopology(),
             supervisor=supervisor,  # type: ignore[arg-type]
         )
-        pause = WmbusmetersPause(("wmbusmeters",))
+        pause = CulConsumerPause(wmbusmeters_addons=("wmbusmeters",))
 
         with self.assertRaisesRegex(FlashError, "serial-by-id path could not be migrated"):
             flasher._migrate_serial_by_id_path(
@@ -942,6 +942,38 @@ class FlasherTests(unittest.TestCase):
             )
 
         self.assertFalse(pause.restore_after_error)
+
+    def test_serial_by_id_migration_retains_opted_in_external_apps(self) -> None:
+        previous = Path("/dev/serial/by-id/usb-busware.de_CUL868-old-if00")
+        current = Path("/dev/serial/by-id/usb-busware.de_CUL868-new-if00")
+
+        class OneAliasTopology(FakeTopology):
+            def by_id_paths_for_tty(self, _device: Path) -> tuple[Path, ...]:
+                return (current,)
+
+        class RetargetingSupervisor(FakeSupervisor):
+            def retarget_own_device_path(self, _old: Path, _new: Path) -> bool:
+                return True
+
+        flasher = Cul868Flasher(
+            self._settings(device=previous),
+            topology=OneAliasTopology(),
+            supervisor=RetargetingSupervisor(),  # type: ignore[arg-type]
+        )
+        pause = CulConsumerPause(additional_addons=("local_homegear",))
+        reports: list[str] = []
+
+        device, retargeted = flasher._migrate_serial_by_id_path(
+            previous,
+            Path("/dev/ttyACM0"),
+            pause,
+            lambda _percent, message: reports.append(message),
+        )
+
+        self.assertEqual(device, current)
+        self.assertEqual(retargeted.addons, ())
+        self.assertEqual(pause.retained_addons, ("local_homegear",))
+        self.assertTrue(any("additional CUL apps remain stopped" in message for message in reports))
 
     def test_qemu_workaround_waits_after_each_identity_transition(self) -> None:
         path, image = self._staged_image()

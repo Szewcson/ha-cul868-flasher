@@ -23,7 +23,6 @@ INGRESS_PORT = 8099
 _TRUSTED_INGRESS_PROXY = "172.30.32.2"
 _MAX_JSON_BYTES = 8 * 1024
 _STAGED_ARTIFACT_TTL_SECONDS = 15 * 60
-_MAX_STAGED_ARTIFACTS = 2
 _STATIC_FILES = {
     "/": ("index.html", "text/html; charset=utf-8"),
     "/app.js": ("app.js", "application/javascript; charset=utf-8"),
@@ -44,7 +43,7 @@ class _StagedArtifact:
 
 
 class _ArtifactRegistry:
-    """Own short-lived private uploads until one flash worker consumes them."""
+    """Own one short-lived private upload until a flash worker consumes it."""
 
     def __init__(self) -> None:
         self._lock = Lock()
@@ -53,15 +52,19 @@ class _ArtifactRegistry:
     def stage(self, image: HexImage, preflight: FlashPreflight) -> str:
         with self._lock:
             self._remove_expired_locked()
-            if len(self._entries) >= _MAX_STAGED_ARTIFACTS:
-                raise IngressError("too many validated firmware images are waiting to be flashed")
+            if any(entry.claimed for entry in self._entries.values()):
+                raise IngressError("a validated firmware image is already being submitted")
+            replaced = tuple(self._entries.values())
+            self._entries.clear()
             identifier = secrets.token_urlsafe(24)
             self._entries[identifier] = _StagedArtifact(
                 image=image,
                 preflight=preflight,
                 expires_at=monotonic() + _STAGED_ARTIFACT_TTL_SECONDS,
             )
-            return identifier
+        for entry in replaced:
+            entry.image.path.unlink(missing_ok=True)
+        return identifier
 
     def claim(self, identifier: object) -> _StagedArtifact:
         if not isinstance(identifier, str) or not 16 <= len(identifier) <= 128:
@@ -121,6 +124,9 @@ class IngressApi:
         self._flasher = flasher
         self._temporary_directory = temporary_directory
         self._artifacts = _ArtifactRegistry()
+        # Serializes the two state transitions that span both the registry and
+        # controller. Upload I/O and USB preflight stay outside this lock.
+        self._submission_lock = Lock()
 
     def status(self) -> dict[str, object]:
         self.expire()
@@ -148,7 +154,11 @@ class IngressApi:
         try:
             image = parse_hex_file(path)
             preflight = self._flasher.preflight()
-            artifact_id = self._artifacts.stage(image, preflight)
+            with self._submission_lock:
+                # A flash can have been submitted while the upload was parsed
+                # or the USB preflight was running.
+                self._require_idle()
+                artifact_id = self._artifacts.stage(image, preflight)
         except Exception:
             path.unlink(missing_ok=True)
             raise
@@ -171,25 +181,26 @@ class IngressApi:
     ) -> dict[str, object]:
         if confirm is not True:
             raise IngressError("explicit confirmation is required before flashing")
-        artifact = self._artifacts.claim(artifact_id)
         assert isinstance(artifact_id, str)
-        try:
-            if artifact.preflight.manual_recovery is not None:
-                if confirm_unpaired_recovery is not True:
-                    raise IngressError(
-                        "explicit confirmation of the unpaired CUL868 DFU bootloader is required"
-                    )
-            elif confirm_unpaired_recovery is not None and confirm_unpaired_recovery is not False:
-                raise IngressError("unpaired CUL868 DFU recovery was not selected for this upload")
-            operation = self._controller.submit(
-                artifact_id,
-                artifact.image,
-                artifact.preflight.manual_recovery,
-            )
-        except Exception:
-            self._artifacts.release_claim(artifact_id)
-            raise
-        self._artifacts.consume(artifact_id)
+        with self._submission_lock:
+            artifact = self._artifacts.claim(artifact_id)
+            try:
+                if artifact.preflight.manual_recovery is not None:
+                    if confirm_unpaired_recovery is not True:
+                        raise IngressError(
+                            "explicit confirmation of the unpaired CUL868 DFU bootloader is required"
+                        )
+                elif confirm_unpaired_recovery is not None and confirm_unpaired_recovery is not False:
+                    raise IngressError("unpaired CUL868 DFU recovery was not selected for this upload")
+                operation = self._controller.submit(
+                    artifact_id,
+                    artifact.image,
+                    artifact.preflight.manual_recovery,
+                )
+            except Exception:
+                self._artifacts.release_claim(artifact_id)
+                raise
+            self._artifacts.consume(artifact_id)
         return {"operation_id": operation.operation_id, "state": "queued"}
 
     @staticmethod

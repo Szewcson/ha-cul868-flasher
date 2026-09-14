@@ -40,6 +40,7 @@ as the sole identity check.
    CUL or failed read is reported in the add-on log but does not prevent the
    flasher from starting.
 4. Choose a firmware `.hex` file, then select **Validate firmware**.
+   Validating another file replaces any earlier unflashed validation.
 5. Review the SHA-256, application address range, and USB preflight result.
 6. Tick the explicit overwrite confirmation and select **Flash CUL868 V3**.
    If the UI identifies an **unpaired CUL DFU bootloader**, verify its physical
@@ -196,7 +197,8 @@ personalities must still be visible to Home Assistant.
   from the Home Assistant Ingress proxy and requires the Ingress request header
   for state-changing calls.
 - Uploads are size-bounded, stored with mode `0600` on add-on tmpfs, expire
-  after 15 minutes, and are deleted after an attempted flash.
+  after 15 minutes, and are deleted after an attempted flash. A newer
+  unflashed validation replaces the previous one.
 - Only one flash can run or queue at a time. A process lock is a second guard
   around serial and raw USB access.
 - `dfu-programmer` receives an exact `atmega32u4:<bus>,<address>` selector

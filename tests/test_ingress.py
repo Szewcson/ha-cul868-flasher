@@ -6,10 +6,11 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from threading import Event, Thread
 
 from app.flasher import FlashPreflight
 from app.ingress import IngressApi, IngressError, IngressServer
-from app.operation import OperationController
+from app.operation import OperationBusyError, OperationController
 from app.usb import ManualRecoveryTarget
 
 from .helpers import minimal_hex
@@ -64,6 +65,71 @@ class IngressApiTests(unittest.TestCase):
             self.assertEqual(queued["operation_id"], operation.operation_id if operation else None)
             assert operation is not None
             self.assertEqual(operation.manual_recovery, ManualRecoveryTarget("2-3", "CUL-TEST"))
+            api.discard_image(operation.image)
+
+    def test_new_validation_replaces_an_unclaimed_artifact(self) -> None:
+        controller = OperationController()
+        with tempfile.TemporaryDirectory() as directory:
+            temporary_directory = Path(directory)
+            api = IngressApi(controller, _IngressFlasher(), temporary_directory)  # type: ignore[arg-type]
+            first = api.validate_upload(io.BytesIO(minimal_hex()), len(minimal_hex()))
+            second = api.validate_upload(io.BytesIO(minimal_hex()), len(minimal_hex()))
+
+            self.assertNotEqual(first["artifact_id"], second["artifact_id"])
+            self.assertEqual(len(list(temporary_directory.iterdir())), 1)
+            with self.assertRaisesRegex(IngressError, "expired or was not found"):
+                api.flash(first["artifact_id"], True, None)
+
+            queued = api.flash(second["artifact_id"], True, None)
+            operation = controller.get(timeout=0)
+            self.assertEqual(queued["operation_id"], operation.operation_id if operation else None)
+            assert operation is not None
+            api.discard_image(operation.image)
+
+    def test_validation_in_preflight_does_not_stage_after_a_flash_is_queued(self) -> None:
+        class BlockingPreflightFlasher(_IngressFlasher):
+            def __init__(self) -> None:
+                super().__init__()
+                self._preflight_calls = 0
+                self.second_preflight_started = Event()
+                self.allow_second_preflight = Event()
+
+            def preflight(self) -> FlashPreflight:
+                self._preflight_calls += 1
+                if self._preflight_calls == 2:
+                    self.second_preflight_started.set()
+                    self.allow_second_preflight.wait(timeout=2)
+                return super().preflight()
+
+        controller = OperationController()
+        flasher = BlockingPreflightFlasher()
+        with tempfile.TemporaryDirectory() as directory:
+            temporary_directory = Path(directory)
+            api = IngressApi(controller, flasher, temporary_directory)  # type: ignore[arg-type]
+            first = api.validate_upload(io.BytesIO(minimal_hex()), len(minimal_hex()))
+            errors: list[Exception] = []
+
+            def validate_second() -> None:
+                try:
+                    api.validate_upload(io.BytesIO(minimal_hex()), len(minimal_hex()))
+                except Exception as err:  # noqa: BLE001 - exercise API failure propagation
+                    errors.append(err)
+
+            thread = Thread(target=validate_second)
+            thread.start()
+            self.assertTrue(flasher.second_preflight_started.wait(timeout=1))
+            try:
+                api.flash(first["artifact_id"], True, None)
+            finally:
+                flasher.allow_second_preflight.set()
+                thread.join(timeout=2)
+
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(len(errors), 1)
+            self.assertIsInstance(errors[0], OperationBusyError)
+            self.assertEqual(len(list(temporary_directory.iterdir())), 1)
+            operation = controller.get(timeout=0)
+            assert operation is not None
             api.discard_image(operation.image)
 
     def test_invalid_upload_is_not_left_in_temporary_directory(self) -> None:

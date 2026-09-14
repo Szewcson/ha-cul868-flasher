@@ -30,15 +30,23 @@ class WmbusmetersPause:
 
     addons: tuple[str, ...]
     _restore_after_error: bool = True
+    _leave_stopped_reason: str = "the CUL firmware did not verify"
 
-    def leave_stopped_after_error(self) -> None:
-        """Keep a reader from reopening a CUL whose firmware is uncertain."""
+    def leave_stopped_after_error(self, reason: str = "the CUL firmware did not verify") -> None:
+        """Keep a reader stopped when reopening the CUL is not yet safe."""
 
         self._restore_after_error = False
+        self._leave_stopped_reason = reason
 
     @property
     def restore_after_error(self) -> bool:
         return self._restore_after_error
+
+    @property
+    def leave_stopped_reason(self) -> str:
+        """Return the operator-facing reason that a paused reader remains stopped."""
+
+        return self._leave_stopped_reason
 
 
 class SupervisorClient:
@@ -93,6 +101,32 @@ class SupervisorClient:
         if not isinstance(state, str) or state not in {"started", "stopped"}:
             raise SupervisorError(f"Supervisor returned an invalid state for {slug}")
         return state
+
+    def hardware_serial_by_id_paths_for_tty(self, device: Path) -> tuple[Path, ...]:
+        """Return canonical by-id aliases for one current serial endpoint.
+
+        The local ``/dev/serial/by-id`` mount can lag behind host udev after a
+        USB personality change. The Supervisor hardware inventory is the
+        authoritative Home Assistant view and relates its ``by_id`` value to
+        the exact ``dev_path``. Accept only direct by-id paths, never an
+        arbitrary path supplied by the API response.
+        """
+
+        _require_tty_path(device)
+        document = self._request("GET", "/hardware/info")
+        data = _require_mapping(document.get("data"), "hardware")
+        devices = data.get("devices")
+        if not isinstance(devices, list):
+            raise SupervisorError("Supervisor returned invalid hardware devices data")
+
+        aliases: set[Path] = set()
+        for entry in devices:
+            if not isinstance(entry, dict) or entry.get("dev_path") != str(device):
+                continue
+            alias = _serial_by_id_path(entry.get("by_id"))
+            if alias is not None:
+                aliases.add(alias)
+        return tuple(sorted(aliases, key=str))
 
     def stop_addon(self, slug: str) -> None:
         self._request("POST", f"/addons/{_quote_slug(slug)}/stop")
@@ -181,7 +215,7 @@ class SupervisorClient:
                 _add_restore_note(err, self._restore(stopped))
             elif stopped:
                 err.add_note(
-                    "wmbusmeters remains stopped because the CUL firmware did not verify"
+                    "wmbusmeters remains stopped because " + pause.leave_stopped_reason
                 )
             raise
         else:
@@ -402,6 +436,30 @@ def _addon_path(slug: str) -> str:
 def _require_serial_by_id_path(value: Path) -> None:
     if value.parent != Path("/dev/serial/by-id") or value.name in {"", ".", ".."}:
         raise SupervisorError("refusing to migrate a device path outside /dev/serial/by-id")
+
+
+def _require_tty_path(value: Path) -> None:
+    candidate = PurePosixPath(value)
+    if (
+        not candidate.is_absolute()
+        or candidate.parent != PurePosixPath("/dev")
+        or not candidate.name.startswith(("ttyACM", "ttyUSB"))
+        or ".." in candidate.parts
+    ):
+        raise SupervisorError("refusing to inspect a serial path outside /dev/ttyACM* or /dev/ttyUSB*")
+
+
+def _serial_by_id_path(value: object) -> Path | None:
+    """Parse one direct, bounded by-id path from Supervisor hardware data."""
+
+    if not isinstance(value, str) or not value or len(value) > 512 or "\x00" in value:
+        return None
+    path = Path(value)
+    try:
+        _require_serial_by_id_path(path)
+    except SupervisorError:
+        return None
+    return path
 
 
 def _require_mapping(value: object, label: str) -> dict[str, Any]:

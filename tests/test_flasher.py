@@ -765,6 +765,108 @@ class FlasherTests(unittest.TestCase):
                 finally:
                     path.unlink(missing_ok=True)
 
+    def test_flash_migrates_by_id_path_from_supervisor_hardware_inventory(self) -> None:
+        path, image = self._staged_image()
+        previous = Path("/dev/serial/by-id/usb-busware.de_CUL868-old-if00")
+        current = Path("/dev/serial/by-id/usb-Atmel_CUL868-new-if00")
+        try:
+            class MissingLocalAliasTopology(FakeTopology):
+                def by_id_paths_for_tty(self, device: Path) -> tuple[Path, ...]:
+                    if device != Path("/dev/ttyACM0"):
+                        raise AssertionError(f"unexpected CUL endpoint: {device}")
+                    return ()
+
+            class HardwareInventorySupervisor(FakeSupervisor):
+                def __init__(self) -> None:
+                    super().__init__()
+                    self.wmbus_retargets: list[tuple[Path, Path]] = []
+                    self.own_retargets: list[tuple[Path, Path]] = []
+                    self.hardware_queries: list[Path] = []
+
+                def hardware_serial_by_id_paths_for_tty(self, device: Path) -> tuple[Path, ...]:
+                    self.hardware_queries.append(device)
+                    return (current,)
+
+                def retarget_paused_wmbusmeters(
+                    self, _pause: object, old: Path, new: Path
+                ) -> tuple[str, ...]:
+                    self.wmbus_retargets.append((old, new))
+                    return ("wmbusmeters",)
+
+                def retarget_own_device_path(self, old: Path, new: Path) -> bool:
+                    self.own_retargets.append((old, new))
+                    return True
+
+            topology = MissingLocalAliasTopology()
+            supervisor = HardwareInventorySupervisor()
+            serial_factory = FakeSerialFactory(topology, ["V 1.67 CUL868", "VTS 0.43 CUL868"])
+
+            def runner(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[object]:
+                if command[-1] == "start":
+                    topology.mode = "application"
+                    topology.application = target(serial="TSCULFW-CUL868")
+                return subprocess.CompletedProcess(command, 0)
+
+            with tempfile.TemporaryDirectory() as state_directory:
+                flasher = Cul868Flasher(
+                    self._settings(device=previous),
+                    topology=topology,
+                    state_store=DeviceStateStore(Path(state_directory)),
+                    supervisor=supervisor,  # type: ignore[arg-type]
+                    serial_factory=serial_factory,  # type: ignore[arg-type]
+                    dfu_executable="/bin/true",
+                    runner=runner,
+                )
+                result = flasher.flash(image, lambda _percent, _message: None)
+
+            self.assertEqual(result["device"], str(current))
+            self.assertEqual(supervisor.hardware_queries, [Path("/dev/ttyACM0")])
+            self.assertEqual(supervisor.wmbus_retargets, [(previous, current)])
+            self.assertEqual(supervisor.own_retargets, [(previous, current)])
+            self.assertEqual(supervisor.events, ["stop", "start"])
+        finally:
+            path.unlink(missing_ok=True)
+
+    def test_waits_for_delayed_local_serial_by_id_alias(self) -> None:
+        current = Path("/dev/serial/by-id/usb-Atmel_CUL868-new-if00")
+
+        class LateAliasTopology(FakeTopology):
+            def __init__(self) -> None:
+                super().__init__()
+                self.alias_checks = 0
+
+            def by_id_paths_for_tty(self, _device: Path) -> tuple[Path, ...]:
+                self.alias_checks += 1
+                return () if self.alias_checks == 1 else (current,)
+
+        clock = [0.0]
+        delays: list[float] = []
+        topology = LateAliasTopology()
+
+        def sleep_for(seconds: float) -> None:
+            delays.append(seconds)
+            clock[0] += seconds
+
+        flasher = Cul868Flasher(
+            self._settings(device=Path("/dev/serial/by-id/usb-busware.de_CUL868-old-if00")),
+            topology=topology,
+            supervisor=FakeSupervisor(),  # type: ignore[arg-type]
+            sleep_fn=sleep_for,
+            monotonic_fn=lambda: clock[0],
+        )
+        reports: list[tuple[int, str]] = []
+
+        aliases = flasher._wait_for_serial_by_id_aliases(
+            Path("/dev/ttyACM0"), lambda percent, message: reports.append((percent, message))
+        )
+
+        self.assertEqual(aliases, (current,))
+        self.assertEqual(delays, [1])
+        self.assertEqual(
+            reports,
+            [(93, "Waiting for the new CUL serial-by-id alias to become available.")],
+        )
+
     def test_flash_refuses_ambiguous_changed_by_id_paths_and_leaves_readers_stopped(self) -> None:
         path, image = self._staged_image()
         previous = Path("/dev/serial/by-id/usb-busware.de_CUL868-old-if00")

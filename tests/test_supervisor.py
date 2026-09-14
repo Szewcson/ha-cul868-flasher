@@ -146,6 +146,39 @@ class SupervisorLifecycleTests(unittest.TestCase):
             ("wmbusmeters-ha-addon",),
         )
 
+    def test_reads_only_canonical_by_id_paths_from_matching_hardware_records(self) -> None:
+        current = Path("/dev/serial/by-id/usb-Atmel_CUL868-new-if00")
+
+        class HardwareSupervisor(SupervisorClient):
+            def _request(self, method: str, path: str) -> dict[str, object]:
+                if method != "GET" or path != "/hardware/info":
+                    raise AssertionError(f"unexpected Supervisor request: {method} {path}")
+                return {
+                    "data": {
+                        "devices": [
+                            {"dev_path": "/dev/ttyACM0", "by_id": str(current)},
+                            {"dev_path": "/dev/ttyACM0", "by_id": str(current)},
+                            {
+                                "dev_path": "/dev/ttyACM0",
+                                "by_id": "/dev/serial/by-id/../not-a-direct-alias",
+                            },
+                            {"dev_path": "/dev/ttyACM0", "by_id": "/dev/ttyACM0"},
+                            {
+                                "dev_path": "/dev/ttyACM1",
+                                "by_id": "/dev/serial/by-id/usb-other-radio-if00",
+                            },
+                        ]
+                    }
+                }
+
+        client = HardwareSupervisor.__new__(HardwareSupervisor)
+        self.assertEqual(client.hardware_serial_by_id_paths_for_tty(Path("/dev/ttyACM0")), (current,))
+
+    def test_refuses_non_tty_hardware_inventory_lookup(self) -> None:
+        client = SupervisorClient.__new__(SupervisorClient)
+        with self.assertRaisesRegex(SupervisorError, "outside /dev/ttyACM"):
+            client.hardware_serial_by_id_paths_for_tty(Path("/dev/serial/by-id/cul868"))
+
     def test_retargets_only_exact_paused_by_id_paths_and_own_option(self) -> None:
         previous = Path("/dev/serial/by-id/usb-busware.de_CUL868-old-if00")
         current = Path("/dev/serial/by-id/usb-busware.de_CUL868-new-if00")

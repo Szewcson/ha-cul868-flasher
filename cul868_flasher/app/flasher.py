@@ -30,6 +30,8 @@ _QEMU_SETTLE_SECONDS = 8
 _MIN_POST_DFU_TIMEOUT_SECONDS = 90
 _VERSION_READ_ATTEMPTS = 3
 _VERSION_RETRY_SECONDS = 1
+_SERIAL_BY_ID_SETTLE_SECONDS = 15
+_SERIAL_BY_ID_POLL_SECONDS = 1
 
 
 class FlashError(RuntimeError):
@@ -446,17 +448,18 @@ class Cul868Flasher:
         if previous.parent != Path("/dev/serial/by-id"):
             return previous, ()
         try:
-            aliases = self._topology.by_id_paths_for_tty(application_device)
-        except UsbTopologyError as err:
-            pause.leave_stopped_after_error()
-            raise FlashError(
-                "CUL firmware verified, but its serial-by-id path could not be inspected; "
-                "wmbusmeters remains stopped"
-            ) from err
+            aliases = self._wait_for_serial_by_id_aliases(application_device, report)
+        except FlashError:
+            pause.leave_stopped_after_error(
+                "the verified CUL serial-by-id path could not be migrated safely"
+            )
+            raise
         if previous in aliases:
             return previous, ()
         if len(aliases) != 1:
-            pause.leave_stopped_after_error()
+            pause.leave_stopped_after_error(
+                "the verified CUL serial-by-id path could not be migrated safely"
+            )
             if not aliases:
                 reason = "no /dev/serial/by-id alias points to the verified CUL serial endpoint"
             else:
@@ -481,7 +484,9 @@ class Cul868Flasher:
                     "CUL868 flasher runtime device path changed while the flash was in progress"
                 )
         except Exception as err:
-            pause.leave_stopped_after_error()
+            pause.leave_stopped_after_error(
+                "the verified CUL serial-by-id path could not be migrated safely"
+            )
             raise FlashError(
                 "CUL firmware verified, but its serial-by-id path could not be migrated; "
                 "wmbusmeters remains stopped"
@@ -489,6 +494,52 @@ class Cul868Flasher:
         if retargeted_wmbusmeters:
             report(96, "Updated matching wmbusmeters serial-by-id paths.")
         return current, retargeted_wmbusmeters
+
+    def _wait_for_serial_by_id_aliases(
+        self, application_device: Path, report: ProgressReporter
+    ) -> tuple[Path, ...]:
+        """Wait briefly for a safe local or Supervisor-provided by-id alias.
+
+        A final ``V``/``VTS`` reply proves the raw CDC endpoint belongs to the
+        newly flashed CUL. Its udev alias can be published slightly later. The
+        Supervisor hardware inventory provides the canonical host alias when a
+        container's local by-id view has not caught up. Both sources are bound
+        to that exact verified endpoint; raw ``ttyACM`` paths are never saved.
+        """
+
+        deadline = self._monotonic() + _SERIAL_BY_ID_SETTLE_SECONDS
+        local_error: UsbTopologyError | None = None
+        supervisor_error: SupervisorError | None = None
+        waiting_reported = False
+        while True:
+            try:
+                aliases = self._topology.by_id_paths_for_tty(application_device)
+            except UsbTopologyError as err:
+                local_error = err
+            else:
+                if aliases:
+                    return aliases
+
+            try:
+                aliases = self._supervisor.hardware_serial_by_id_paths_for_tty(application_device)
+            except SupervisorError as err:
+                supervisor_error = err
+            else:
+                if aliases:
+                    return aliases
+
+            remaining = deadline - self._monotonic()
+            if remaining <= 0:
+                if local_error is not None and supervisor_error is not None:
+                    raise FlashError(
+                        "CUL firmware verified, but its serial-by-id path could not be inspected "
+                        "locally or through Supervisor hardware inventory"
+                    ) from supervisor_error
+                return ()
+            if not waiting_reported:
+                report(93, "Waiting for the new CUL serial-by-id alias to become available.")
+                waiting_reported = True
+            self._sleep(min(_SERIAL_BY_ID_POLL_SECONDS, remaining))
 
     def _plan(
         self,

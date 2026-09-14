@@ -146,3 +146,8 @@ class FakeSupervisor:
             raise
         else:
             self.events.append("start")
+
+    def hardware_serial_by_id_paths_for_tty(self, _device: Path) -> tuple[Path, ...]:
+        """The default fake has no Supervisor-only alias information."""
+
+        return ()

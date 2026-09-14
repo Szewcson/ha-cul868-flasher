@@ -95,21 +95,25 @@ therefore legitimately change the `/dev/serial/by-id/...` filename even though
 the physical CUL868 is the same device.
 
 After the new firmware has appeared on the already verified physical USB path
-and answered `V` or `VTS`, the add-on checks the aliases that resolve to that
-exact new CDC endpoint. If the configured path is a direct
-`/dev/serial/by-id/...` alias, its old alias disappeared, and exactly one new
-alias exists, the add-on updates its own option and the exact direct path in
-any wmbusmeters instances it paused for this flash. The running process also
-uses the new path for a later operation without requiring a restart.
+and answered `V` or `VTS`, the add-on waits briefly for the aliases that
+resolve to that exact new CDC endpoint. If the add-on's local udev view has
+not caught up, it also reads the canonical `by_id` value for that exact
+`dev_path` from the Supervisor [hardware inventory API](https://developers.home-assistant.io/docs/api/supervisor/endpoints/#get-hardwareinfo).
+If the configured path is a direct `/dev/serial/by-id/...` alias, its old
+alias disappeared, and exactly one new alias exists, the add-on updates its
+own option and the exact direct path in any wmbusmeters instances it paused
+for this flash. The running process also uses the new path for a later
+operation without requiring a restart.
 
 The migration deliberately refuses to guess when no alias or more than one
 alias resolves to the verified endpoint, or when the add-on option no longer
 contains the expected old path when it is checked. In that case the firmware is
-still reported as verified, but matching wmbusmeters instances remain stopped
-until the path is resolved manually. `auto`, `cul`, raw `/dev/ttyACM*`, and
-unrelated wmbusmeters configurations are never rewritten. Avoid editing either
-add-on's device option during a flash: the Supervisor options API does not
-provide an atomic compare-and-set update.
+still verified, but its configuration migration needs attention and matching
+wmbusmeters instances remain stopped until the path is resolved manually.
+`auto`, `cul`, raw `/dev/ttyACM*`, and unrelated wmbusmeters configurations
+are never rewritten. Avoid editing either add-on's device option during a
+flash: the Supervisor options API does not provide an atomic compare-and-set
+update.
 
 ## wmbusmeters coordination
 

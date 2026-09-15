@@ -82,13 +82,21 @@ class OperationController:
                 except Empty:
                     break
             if pending and self._status == "queued":
-                self._status = "idle"
-                self._operation_id = None
-                self._progress = 0
-                self._message = "No flash operation is running."
-                self._error = None
-                self._append_event("discarded", "Queued firmware was discarded during shutdown.")
+                self._discard_queued_locked("Queued firmware was discarded during shutdown.")
         return tuple(pending)
+
+    def discard_queued(self, operation_id: str) -> None:
+        """Discard a dequeued operation when shutdown wins before it starts.
+
+        The worker owns an item after ``get``; this method moves the visible
+        state back to idle without ever calling the flasher for that item.
+        """
+
+        with self._lock:
+            self._require_current(operation_id)
+            if self._status != "queued":
+                raise ValueError("only a queued flash operation can be discarded")
+            self._discard_queued_locked("Queued firmware was discarded during shutdown.")
 
     def mark_running(self, operation_id: str) -> None:
         with self._lock:
@@ -144,6 +152,14 @@ class OperationController:
     def _require_current(self, operation_id: str) -> None:
         if operation_id != self._operation_id:
             raise ValueError("flash operation is no longer current")
+
+    def _discard_queued_locked(self, message: str) -> None:
+        self._status = "idle"
+        self._operation_id = None
+        self._progress = 0
+        self._message = "No flash operation is running."
+        self._error = None
+        self._append_event("discarded", message)
 
     def _append_event(self, kind: str, message: str) -> None:
         self._events.append({"at": int(time()), "kind": kind, "message": message})

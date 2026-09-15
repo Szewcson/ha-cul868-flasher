@@ -14,6 +14,8 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
+from . import __version__
+
 _MAX_RESPONSE_BYTES = 256 * 1024
 _REQUEST_TIMEOUT_SECONDS = 15
 _STATE_TIMEOUT_SECONDS = 30
@@ -361,7 +363,7 @@ class SupervisorClient:
             headers={
                 "Authorization": f"Bearer {self._token}",
                 "Content-Type": "application/json",
-                "User-Agent": "cul868-flasher/0.1",
+                "User-Agent": f"cul868-flasher/{__version__}",
             },
         )
         try:

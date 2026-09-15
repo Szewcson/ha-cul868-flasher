@@ -8,7 +8,12 @@ from pathlib import Path
 from app.flasher import Cul868Flasher, FlashError
 from app.hexfile import parse_hex_file
 from app.models import Settings
-from app.state import DeviceStateStore, KnownDevice
+from app.state import (
+    RECOVERY_BINDING_HANDOFF_PENDING,
+    RECOVERY_BINDING_OBSERVED_BOOTLOADER,
+    DeviceStateStore,
+    KnownDevice,
+)
 from app.supervisor import CulConsumerPause, CulConsumerRetarget
 
 from .helpers import FakeSerialFactory, FakeSupervisor, FakeTopology, minimal_hex, target
@@ -247,6 +252,7 @@ class FlasherTests(unittest.TestCase):
                     serial_factory=FakeSerialFactory(topology, ["V 1.0 CUL868"]),  # type: ignore[arg-type]
                     sleep_fn=sleep_for,
                     monotonic_fn=lambda: clock[0],
+                    time_fn=lambda: 1_000,
                 )
                 with self.assertRaisesRegex(FlashError, "DFU bootloader 03eb:2ff4 did not appear"):
                     flasher.flash(image, lambda _percent, _message: None)
@@ -258,6 +264,8 @@ class FlasherTests(unittest.TestCase):
             self.assertEqual(known.usb_serial, "CUL-TEST")
             self.assertEqual(known.configured_device, "/dev/ttyACM0")
             self.assertIsNone(known.version)
+            self.assertEqual(known.recovery_binding, RECOVERY_BINDING_HANDOFF_PENDING)
+            self.assertEqual(known.handoff_deadline, 1_090)
         finally:
             path.unlink(missing_ok=True)
 
@@ -273,7 +281,11 @@ class FlasherTests(unittest.TestCase):
                 supervisor=FakeSupervisor(),  # type: ignore[arg-type]
             )
             with self.assertRaisesRegex(FlashError, "different USB serial"):
-                flasher.preflight()
+                flasher._plan()
+            preflight = flasher.preflight()
+
+        self.assertEqual(preflight.mode, "manual-recovery")
+        self.assertIsNotNone(preflight.manual_recovery)
 
     def test_interrupted_handoff_recovers_when_bootloader_uses_its_own_serial(self) -> None:
         """A B01 handoff saved before DFU can recover a standard Atmel descriptor."""
@@ -281,7 +293,100 @@ class FlasherTests(unittest.TestCase):
         topology = FakeTopology(mode="bootloader", serial="AT32U4-DFU")
         with tempfile.TemporaryDirectory() as state_directory:
             state = DeviceStateStore(Path(state_directory))
-            state.save(KnownDevice("2-3", "TSCULFW-CUL868", None, "/dev/ttyACM0"))
+            state.save(
+                KnownDevice(
+                    "2-3",
+                    "TSCULFW-CUL868",
+                    None,
+                    "/dev/ttyACM0",
+                    RECOVERY_BINDING_HANDOFF_PENDING,
+                    1_090,
+                )
+            )
+            flasher = Cul868Flasher(
+                self._settings(),
+                topology=topology,
+                state_store=state,
+                supervisor=FakeSupervisor(),  # type: ignore[arg-type]
+                time_fn=lambda: 1_000,
+            )
+
+            preflight = flasher.preflight()
+
+        self.assertEqual(preflight.mode, "recovery")
+        self.assertEqual(preflight.topology, "2-3")
+
+    def test_expired_handoff_requires_manual_recovery(self) -> None:
+        topology = FakeTopology(mode="bootloader", serial="AT32U4-DFU")
+        with tempfile.TemporaryDirectory() as state_directory:
+            state = DeviceStateStore(Path(state_directory))
+            state.save(
+                KnownDevice(
+                    "2-3",
+                    "TSCULFW-CUL868",
+                    None,
+                    "/dev/ttyACM0",
+                    RECOVERY_BINDING_HANDOFF_PENDING,
+                    999,
+                )
+            )
+            flasher = Cul868Flasher(
+                self._settings(),
+                topology=topology,
+                state_store=state,
+                supervisor=FakeSupervisor(),  # type: ignore[arg-type]
+                time_fn=lambda: 1_000,
+            )
+
+            with self.assertRaisesRegex(FlashError, "handoff expired"):
+                flasher._plan()
+            preflight = flasher.preflight()
+
+        self.assertEqual(preflight.mode, "manual-recovery")
+        self.assertIsNotNone(preflight.manual_recovery)
+
+    def test_handoff_with_an_unbounded_future_deadline_requires_manual_recovery(self) -> None:
+        topology = FakeTopology(mode="bootloader", serial="AT32U4-DFU")
+        with tempfile.TemporaryDirectory() as state_directory:
+            state = DeviceStateStore(Path(state_directory))
+            state.save(
+                KnownDevice(
+                    "2-3",
+                    "TSCULFW-CUL868",
+                    None,
+                    "/dev/ttyACM0",
+                    RECOVERY_BINDING_HANDOFF_PENDING,
+                    1_091,
+                )
+            )
+            flasher = Cul868Flasher(
+                self._settings(),
+                topology=topology,
+                state_store=state,
+                supervisor=FakeSupervisor(),  # type: ignore[arg-type]
+                time_fn=lambda: 1_000,
+            )
+
+            with self.assertRaisesRegex(FlashError, "invalid time window"):
+                flasher._plan()
+            preflight = flasher.preflight()
+
+        self.assertEqual(preflight.mode, "manual-recovery")
+        self.assertIsNotNone(preflight.manual_recovery)
+
+    def test_observed_bootloader_serial_change_requires_manual_recovery(self) -> None:
+        topology = FakeTopology(mode="bootloader", serial="REPLACEMENT-DFU")
+        with tempfile.TemporaryDirectory() as state_directory:
+            state = DeviceStateStore(Path(state_directory))
+            state.save(
+                KnownDevice(
+                    "2-3",
+                    "OBSERVED-DFU",
+                    None,
+                    "/dev/ttyACM0",
+                    RECOVERY_BINDING_OBSERVED_BOOTLOADER,
+                )
+            )
             flasher = Cul868Flasher(
                 self._settings(),
                 topology=topology,
@@ -289,10 +394,12 @@ class FlasherTests(unittest.TestCase):
                 supervisor=FakeSupervisor(),  # type: ignore[arg-type]
             )
 
+            with self.assertRaisesRegex(FlashError, "different USB serial"):
+                flasher._plan()
             preflight = flasher.preflight()
 
-        self.assertEqual(preflight.mode, "recovery")
-        self.assertEqual(preflight.topology, "2-3")
+        self.assertEqual(preflight.mode, "manual-recovery")
+        self.assertIsNotNone(preflight.manual_recovery)
 
     def test_changed_configured_path_requires_explicit_unpaired_recovery(self) -> None:
         topology = FakeTopology(mode="bootloader", serial="CUL-TEST")
@@ -381,6 +488,7 @@ class FlasherTests(unittest.TestCase):
             assert known is not None
             self.assertEqual(known.topology, "2-3")
             self.assertIsNone(known.version)
+            self.assertEqual(known.recovery_binding, RECOVERY_BINDING_OBSERVED_BOOTLOADER)
             self.assertEqual(supervisor.events, ["stop"])
         finally:
             path.unlink(missing_ok=True)

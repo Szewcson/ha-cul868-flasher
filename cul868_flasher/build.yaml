@@ -1,4 +1,4 @@
 build_from:
-  aarch64: ghcr.io/home-assistant/aarch64-base:3.24
-  amd64: ghcr.io/home-assistant/amd64-base:3.24
-
+  # Tag and digest identify the exact base image used for this add-on release.
+  aarch64: ghcr.io/home-assistant/aarch64-base:3.24@sha256:1b29b917841ca169fa3bece7bb03ae366e9df94a4d382698796a44c5abb3f2b5
+  amd64: ghcr.io/home-assistant/amd64-base:3.24@sha256:db83d263152a02d6daf3415a73132b2386f43a03a9c248bdaabe047b067c8eea

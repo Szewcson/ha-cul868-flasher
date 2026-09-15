@@ -49,3 +49,20 @@ class OperationTests(unittest.TestCase):
             controller.fail(replacement.operation_id, error)
 
         self.assertIn("wmbusmeters could not be restored", controller.snapshot()["error"])
+
+    def test_dequeued_operation_can_be_discarded_before_it_starts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "firmware.hex"
+            path.write_bytes(minimal_hex())
+            image = parse_hex_file(path)
+            controller = OperationController()
+            operation = controller.submit("artifact", image)
+
+            dequeued = controller.get(timeout=0)
+            self.assertEqual(dequeued, operation)
+            controller.discard_queued(operation.operation_id)
+
+        snapshot = controller.snapshot()
+        self.assertEqual(snapshot["status"], "idle")
+        self.assertEqual(snapshot["operation_id"], None)
+        self.assertEqual(snapshot["events"][-1]["kind"], "discarded")

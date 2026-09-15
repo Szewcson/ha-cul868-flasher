@@ -1,4 +1,6 @@
-ARG BUILD_FROM=ghcr.io/home-assistant/amd64-base:3.24
+# Keep the release tag visible for maintainers, but pin the platform manifest
+# so one source revision cannot silently rebuild from a different base image.
+ARG BUILD_FROM=ghcr.io/home-assistant/amd64-base:3.24@sha256:db83d263152a02d6daf3415a73132b2386f43a03a9c248bdaabe047b067c8eea
 ARG DFU_PROGRAMMER_VERSION=v1.1.0
 ARG DFU_PROGRAMMER_REVISION=f23d6dfd6671b46cbf1279a61291f6fa18d7559e
 ARG LIBUSB_VERSION=1.0.30

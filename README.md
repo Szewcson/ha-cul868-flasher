@@ -5,6 +5,11 @@ Intel HEX firmware image to a **CUL868 V3** USB radio. It is intentionally not
 an updater: it does not discover releases, download firmware, build firmware,
 or flash without confirmation.
 
+The app-store overview is in [`cul868_flasher/README.md`](cul868_flasher/README.md)
+and its Home Assistant-facing operating guide is in
+[`cul868_flasher/DOCS.md`](cul868_flasher/DOCS.md). This root document remains
+the project-level reference.
+
 ## Scope and target identification
 
 The add-on supports only a CUL868 V3, whose normal application is built for an
@@ -65,8 +70,7 @@ non-secret identity data. If a failed flash leaves that same radio in
 `03eb:2ff4` DFU mode, the add-on can still start even though the normal TTY no
 longer exists. The UI can then perform recovery only when the configuration
 still names that exact saved serial path. It will never choose an arbitrary DFU
-device merely because it is the only bootloader currently visible, or reuse
-recovery state after the selected CUL device changes.
+device merely because it is the only bootloader currently visible.
 
 The Supervisor configuration intentionally uses a plain string rather than a
 `device(subsystem=tty)` selector: the latter rejects add-on startup while the
@@ -74,8 +78,14 @@ normal TTY is absent. The app still validates the value as a bounded `/dev/...`
 path and requires the saved physical USB topology before it can touch DFU.
 
 As soon as the add-on requests `B01`, the prior firmware version is marked
-unknown. The add-on keeps the verified topology for recovery, but will not keep
-showing a stale firmware version after a failed or incomplete write.
+unknown. It writes a short-lived `handoff-pending` record in which the expected
+application-to-bootloader USB descriptor change is allowed. The window lasts no
+longer than the post-DFU timeout (90 to 120 seconds), after which a changed
+descriptor serial requires manual confirmation. Once the DFU bootloader has
+been observed, the state changes to `observed-bootloader`: every later DFU
+command and automatic recovery must match that exact observed serial and USB
+topology. A changed serial gets the explicit one-time recovery flow instead of
+silently inheriting trust from an unknown firmware state.
 
 If the radio has never been verified by this add-on and is already in DFU mode,
 the UI can offer one-time recovery only when exactly one `03eb:2ff4` CUL868
@@ -198,7 +208,10 @@ personalities must still be visible to Home Assistant.
   for state-changing calls.
 - Uploads are size-bounded, stored with mode `0600` on add-on tmpfs, expire
   after 15 minutes, and are deleted after an attempted flash. A newer
-  unflashed validation replaces the previous one.
+  unflashed validation replaces the previous one. Once shutdown is requested,
+  later upload and flash handoffs are rejected before queued work is discarded.
+  A request accepted immediately before that boundary is reported as discarded,
+  never flashed after shutdown begins.
 - Only one flash can run or queue at a time. A process lock is a second guard
   around serial and raw USB access.
 - `dfu-programmer` receives an exact `atmega32u4:<bus>,<address>` selector

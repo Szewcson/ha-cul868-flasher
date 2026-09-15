@@ -119,6 +119,7 @@ class IngressApi:
         controller: OperationController,
         flasher: Cul868Flasher,
         temporary_directory: Path = Path("/tmp"),
+        stopping: Event | None = None,
     ) -> None:
         self._controller = controller
         self._flasher = flasher
@@ -127,6 +128,10 @@ class IngressApi:
         # Serializes the two state transitions that span both the registry and
         # controller. Upload I/O and USB preflight stay outside this lock.
         self._submission_lock = Lock()
+        self._accepting_mutations = True
+        # Signal handlers only set this event. Request threads observe it while
+        # holding the admission lock, avoiding lock acquisition in a handler.
+        self._stopping = stopping if stopping is not None else Event()
 
     def status(self) -> dict[str, object]:
         self.expire()
@@ -149,14 +154,17 @@ class IngressApi:
         return self._controller.snapshot()
 
     def validate_upload(self, stream: BinaryIO, content_length: int) -> dict[str, object]:
-        self._require_idle()
+        with self._submission_lock:
+            self._require_accepting_mutations_locked()
+            self._require_idle()
         path = write_upload(stream, content_length, self._temporary_directory)
         try:
             image = parse_hex_file(path)
             preflight = self._flasher.preflight()
             with self._submission_lock:
                 # A flash can have been submitted while the upload was parsed
-                # or the USB preflight was running.
+                # or shutdown can have closed admission while it was running.
+                self._require_accepting_mutations_locked()
                 self._require_idle()
                 artifact_id = self._artifacts.stage(image, preflight)
         except Exception:
@@ -183,6 +191,7 @@ class IngressApi:
             raise IngressError("explicit confirmation is required before flashing")
         assert isinstance(artifact_id, str)
         with self._submission_lock:
+            self._require_accepting_mutations_locked()
             artifact = self._artifacts.claim(artifact_id)
             try:
                 if artifact.preflight.manual_recovery is not None:
@@ -207,7 +216,14 @@ class IngressApi:
     def discard_image(image: HexImage) -> None:
         image.path.unlink(missing_ok=True)
 
+    def close_admission(self) -> None:
+        """Atomically reject new uploads and flash submissions during shutdown."""
+
+        with self._submission_lock:
+            self._accepting_mutations = False
+
     def close(self) -> None:
+        self.close_admission()
         self._artifacts.close()
 
     def expire(self) -> None:
@@ -216,6 +232,10 @@ class IngressApi:
     def _require_idle(self) -> None:
         if self._controller.snapshot()["status"] in {"queued", "running"}:
             raise OperationBusyError("a CUL868 flash operation is already pending or active")
+
+    def _require_accepting_mutations_locked(self) -> None:
+        if self._stopping.is_set() or not self._accepting_mutations:
+            raise IngressError("CUL868 Firmware Flasher is stopping and cannot accept a new flash")
 
 
 class IngressServer:
@@ -261,6 +281,10 @@ class IngressServer:
         LOGGER.info("Started Home Assistant Ingress server on port %s", self.port)
 
     def stop(self) -> None:
+        # Close the registry/controller handoff before stopping the HTTP
+        # listener. Handler threads that were still parsing a request recheck
+        # this gate before staging or submitting any hardware operation.
+        self._api.close_admission()
         server = self._server
         thread = self._thread
         reaper_thread = self._reaper_thread
@@ -275,7 +299,6 @@ class IngressServer:
             thread.join(timeout=5)
         if reaper_thread is not None:
             reaper_thread.join(timeout=5)
-        self._api.close()
 
     def _reap_expired_artifacts(self) -> None:
         while not self._reaper_stop.wait(30):

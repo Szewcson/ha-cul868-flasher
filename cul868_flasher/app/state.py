@@ -13,21 +13,37 @@ from .usb import validate_usb_topology
 
 _MAX_STATE_BYTES = 4 * 1024
 _STATE_FILENAME = "cul868-flasher-state.json"
+RECOVERY_BINDING_VERIFIED_APPLICATION = "verified-application"
+RECOVERY_BINDING_HANDOFF_PENDING = "handoff-pending"
+RECOVERY_BINDING_OBSERVED_BOOTLOADER = "observed-bootloader"
+RECOVERY_BINDING_LEGACY_UNKNOWN = "legacy-unknown"
+_RECOVERY_BINDINGS = frozenset(
+    {
+        RECOVERY_BINDING_VERIFIED_APPLICATION,
+        RECOVERY_BINDING_HANDOFF_PENDING,
+        RECOVERY_BINDING_OBSERVED_BOOTLOADER,
+        RECOVERY_BINDING_LEGACY_UNKNOWN,
+    }
+)
 
 
 @dataclass(frozen=True)
 class KnownDevice:
-    """Non-secret CUL identity, with a version only after application verification.
+    """Non-secret CUL identity and the provenance of its recovery binding.
 
-    During an uncertain handoff, ``usb_serial`` is the most recently observed
-    descriptor serial. It is replaced with the application descriptor only
-    after the firmware answers a validated ``V`` or ``VTS`` response.
+    An application and its DFU bootloader can publish different descriptor
+    serials. A changed serial is therefore accepted only during the short,
+    persisted ``handoff-pending`` interval immediately after ``B01``. Once a
+    DFU descriptor has been observed, recovery binds to that descriptor rather
+    than treating every unknown firmware state as an in-progress handoff.
     """
 
     topology: str
     usb_serial: str | None
     version: str | None
     configured_device: str | None = None
+    recovery_binding: str = RECOVERY_BINDING_LEGACY_UNKNOWN
+    handoff_deadline: int | None = None
 
 
 class DeviceStateStore:
@@ -57,15 +73,38 @@ class DeviceStateStore:
         serial = _safe_optional_text(document.get("usb_serial"), 128)
         version = _safe_optional_text(document.get("version"), 512)
         configured_device = _safe_optional_device_path(document.get("configured_device"))
-        return KnownDevice(topology, serial, version, configured_device)
+        recovery_binding = _recovery_binding_for_document(document, version)
+        if recovery_binding is None:
+            return None
+        handoff_deadline = _safe_handoff_deadline(document.get("handoff_deadline"))
+        if recovery_binding == RECOVERY_BINDING_HANDOFF_PENDING and handoff_deadline is None:
+            return None
+        if recovery_binding != RECOVERY_BINDING_HANDOFF_PENDING:
+            handoff_deadline = None
+        return KnownDevice(
+            topology,
+            serial,
+            version,
+            configured_device,
+            recovery_binding,
+            handoff_deadline,
+        )
 
     def save(self, device: KnownDevice) -> None:
+        recovery_binding = _require_recovery_binding(device.recovery_binding)
+        handoff_deadline = _safe_handoff_deadline(device.handoff_deadline)
+        if recovery_binding == RECOVERY_BINDING_HANDOFF_PENDING and handoff_deadline is None:
+            raise ValueError("handoff-pending recovery state requires a deadline")
+        if recovery_binding != RECOVERY_BINDING_HANDOFF_PENDING:
+            handoff_deadline = None
         payload = json.dumps(
             {
                 "topology": validate_usb_topology(device.topology),
                 "usb_serial": _safe_optional_text(device.usb_serial, 128),
                 "version": _safe_optional_text(device.version, 512),
                 "configured_device": _safe_optional_device_path(device.configured_device),
+                "recovery_binding": recovery_binding,
+                "handoff_deadline": handoff_deadline,
             },
             ensure_ascii=True,
             separators=(",", ":"),
@@ -102,5 +141,37 @@ def _safe_optional_device_path(value: object) -> str | None:
         return None
     path = PurePosixPath(value)
     if not path.is_absolute() or path.parts[:2] != ("/", "dev") or ".." in path.parts:
+        return None
+    return value
+
+
+def _recovery_binding_for_document(
+    document: dict[str, object], version: str | None
+) -> str | None:
+    """Migrate pre-phase records conservatively without silently widening trust."""
+
+    if "recovery_binding" not in document:
+        # Older verified application records can retain their strict serial
+        # binding. Older unknown records cannot prove whether their serial was
+        # observed before or after the USB personality changed.
+        return (
+            RECOVERY_BINDING_VERIFIED_APPLICATION
+            if version is not None
+            else RECOVERY_BINDING_LEGACY_UNKNOWN
+        )
+    value = document.get("recovery_binding")
+    return value if isinstance(value, str) and value in _RECOVERY_BINDINGS else None
+
+
+def _require_recovery_binding(value: object) -> str:
+    if not isinstance(value, str) or value not in _RECOVERY_BINDINGS:
+        raise ValueError("recovery binding is invalid")
+    return value
+
+
+def _safe_handoff_deadline(value: object) -> int | None:
+    # Unix timestamps are only a bounded expiry marker, never an authorization
+    # token. Reject booleans because bool is a subclass of int in Python.
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 4_102_444_800:
         return None
     return value

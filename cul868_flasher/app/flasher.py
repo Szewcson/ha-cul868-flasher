@@ -12,13 +12,19 @@ from contextlib import AbstractContextManager
 from dataclasses import dataclass, replace
 from pathlib import Path
 from threading import Lock
-from time import monotonic, sleep
+from time import monotonic, sleep, time
 from typing import Protocol, Self
 
 from .hexfile import HexImage, parse_hex_file
 from .models import Settings
 from .serial import CulSerial
-from .state import DeviceStateStore, KnownDevice
+from .state import (
+    RECOVERY_BINDING_HANDOFF_PENDING,
+    RECOVERY_BINDING_OBSERVED_BOOTLOADER,
+    RECOVERY_BINDING_VERIFIED_APPLICATION,
+    DeviceStateStore,
+    KnownDevice,
+)
 from .supervisor import CulConsumerPause, CulConsumerRetarget, SupervisorClient, SupervisorError
 from .usb import ManualRecoveryTarget, UsbTarget, UsbTopology, UsbTopologyError
 
@@ -101,6 +107,7 @@ class Cul868Flasher:
         runner: Callable[..., subprocess.CompletedProcess[object]] = subprocess.run,
         sleep_fn: Callable[[float], None] = sleep,
         monotonic_fn: Callable[[], float] = monotonic,
+        time_fn: Callable[[], float] = time,
     ) -> None:
         self._settings = settings
         self._topology = topology or UsbTopology()
@@ -111,6 +118,7 @@ class Cul868Flasher:
         self._runner = runner
         self._sleep = sleep_fn
         self._monotonic = monotonic_fn
+        self._time = time_fn
         self._flash_lock = Lock()
         # Settings instances are immutable. Guard replacing the instance after
         # a verified firmware descriptor change so status readers see one
@@ -147,6 +155,15 @@ class Cul868Flasher:
                 try:
                     bootloader = self._bootloader_for_known(known_for_config)
                 except FlashError as bootloader_error:
+                    try:
+                        manual_recovery = self._single_unpaired_recovery_target()
+                    except FlashError as recovery_error:
+                        return self._status_error(known_for_config, str(recovery_error))
+                    if manual_recovery is not None:
+                        return self._unpaired_bootloader_status(
+                            manual_recovery,
+                            f"Automatic recovery is refused: {bootloader_error}",
+                        )
                     return self._status_error(known_for_config, str(bootloader_error))
                 if bootloader is not None:
                     return {
@@ -163,16 +180,7 @@ class Cul868Flasher:
                     known_for_config, f"{application_error}. {recovery_error}"
                 )
             if manual_recovery is not None:
-                return {
-                    "state": "unpaired_bootloader",
-                    "topology": manual_recovery.topology,
-                    "usb_serial": manual_recovery.usb_serial,
-                    "last_verified_version": None,
-                    "message": (
-                        "One unpaired CUL868 DFU bootloader is present. Validate firmware, then "
-                        "explicitly confirm that this is the configured CUL868 before recovery."
-                    ),
-                }
+                return self._unpaired_bootloader_status(manual_recovery)
             return self._status_error(known_for_config, str(application_error))
         return {
             "state": "application",
@@ -241,6 +249,7 @@ class Cul868Flasher:
                             application.usb_serial,
                             version,
                             str(settings.device),
+                            RECOVERY_BINDING_VERIFIED_APPLICATION,
                         )
                     )
             except FlashError:
@@ -298,7 +307,7 @@ class Cul868Flasher:
                         pause.leave_stopped_after_error()
                     else:
                         report(15, "Using the saved CUL868 USB path in DFU recovery mode.")
-                        self._begin_uncertain_transition(plan, pause.leave_stopped_after_error)
+                        pause.leave_stopped_after_error()
                     bootloader = self._wait_for_bootloader(
                         plan.topology,
                         plan.bootloader.usb_serial if plan.bootloader is not None else None,
@@ -309,22 +318,14 @@ class Cul868Flasher:
                 # Application firmware and the Atmel/LUFA bootloader are
                 # separate USB personalities and may have different serials.
                 # Persist the observed DFU identity before destructive commands
-                # so recovery can bind to the actual bootloader after a failure.
-                self._store_unverified(plan, bootloader.usb_serial, topology=dfu_topology)
+                # so later recovery cannot mistake it for a fresh B01 handoff.
+                self._store_observed_bootloader(plan, bootloader, topology=dfu_topology)
                 if dfu_topology != plan.topology:
                     report(
                         30,
                         f"QEMU reattached the CUL DFU bootloader on guest USB path {dfu_topology}.",
                     )
 
-                if plan.manual_recovery is not None:
-                    # The explicit recovery confirmation authorizes this new
-                    # binding only once erase may change the target.
-                    self._store_unverified(
-                        plan,
-                        bootloader.usb_serial,
-                        topology=dfu_topology,
-                    )
                 report(35, "Running the standard CUL DFU erase command.")
                 self._run_dfu(dfu_topology, bootloader.usb_serial, "erase")
                 report(55, "Writing the validated firmware image.")
@@ -367,6 +368,7 @@ class Cul868Flasher:
                         application.usb_serial,
                         after,
                         str(settings.device),
+                        RECOVERY_BINDING_VERIFIED_APPLICATION,
                     )
                 )
                 configured_device, retargeted_consumers = self._migrate_serial_by_id_path(
@@ -382,6 +384,7 @@ class Cul868Flasher:
                             application.usb_serial,
                             after,
                             str(configured_device),
+                            RECOVERY_BINDING_VERIFIED_APPLICATION,
                         )
                     )
 
@@ -400,17 +403,42 @@ class Cul868Flasher:
                 "firmware_bytes": image.data_bytes,
             }
 
-    def _store_unverified(
+    def _store_observed_bootloader(
         self,
         plan: _FlashPlan,
-        usb_serial: str | None,
+        bootloader: UsbTarget,
         *,
         topology: str | None = None,
     ) -> None:
-        """Persist only the safe recovery binding after an uncertain transition."""
+        """Bind an interrupted update to the exact DFU descriptor that was seen.
+
+        This is deliberately distinct from the brief application-to-DFU
+        handoff below. A later descriptor change requires explicit recovery
+        confirmation instead of silently inheriting trust from this topology.
+        """
 
         self._state.save(
-            KnownDevice(topology or plan.topology, usb_serial, None, str(self._settings.device))
+            KnownDevice(
+                topology or plan.topology,
+                bootloader.usb_serial,
+                None,
+                str(self._settings_snapshot().device),
+                RECOVERY_BINDING_OBSERVED_BOOTLOADER,
+            )
+        )
+
+    def _store_handoff_pending(self, plan: _FlashPlan) -> None:
+        """Persist the bounded state in which an application may change descriptor."""
+
+        self._state.save(
+            KnownDevice(
+                plan.topology,
+                self._transition_usb_serial(plan),
+                None,
+                str(self._settings_snapshot().device),
+                RECOVERY_BINDING_HANDOFF_PENDING,
+                int(self._time()) + self._post_dfu_timeout(),
+            )
         )
 
     def _begin_uncertain_transition(
@@ -420,7 +448,7 @@ class Cul868Flasher:
     ) -> None:
         """Preserve recovery state before a CUL can leave its normal application."""
 
-        self._store_unverified(plan, self._transition_usb_serial(plan))
+        self._store_handoff_pending(plan)
         leave_stopped_after_error()
 
     @staticmethod
@@ -568,15 +596,6 @@ class Cul868Flasher:
         try:
             application = self._topology.configured_application(settings.device)
         except UsbTopologyError as application_error:
-            if known_for_config is not None:
-                try:
-                    bootloader = self._bootloader_for_known(known_for_config)
-                except FlashError as bootloader_error:
-                    raise FlashError(str(bootloader_error)) from bootloader_error
-                if bootloader is not None:
-                    return _FlashPlan(
-                        "recovery", known_for_config.topology, None, bootloader, known_for_config
-                    )
             if manual_recovery is not None:
                 bootloader = self._manual_bootloader_for_target(manual_recovery)
                 return _FlashPlan(
@@ -587,6 +606,18 @@ class Cul868Flasher:
                     None,
                     manual_recovery,
                 )
+
+            recovery_error: FlashError | None = None
+            if known_for_config is not None:
+                try:
+                    bootloader = self._bootloader_for_known(known_for_config)
+                except FlashError as bootloader_error:
+                    recovery_error = bootloader_error
+                else:
+                    if bootloader is not None:
+                        return _FlashPlan(
+                            "recovery", known_for_config.topology, None, bootloader, known_for_config
+                        )
             if allow_unpaired_recovery:
                 discovered = self._single_unpaired_recovery_target()
                 if discovered is not None:
@@ -599,6 +630,8 @@ class Cul868Flasher:
                         None,
                         discovered,
                     )
+            if recovery_error is not None:
+                raise FlashError(str(recovery_error)) from recovery_error
             if known is not None and known_for_config is None:
                 raise FlashError(
                     "configured CUL serial path changed since the last verified device; "
@@ -644,17 +677,40 @@ class Cul868Flasher:
             bootloader = self._topology.bootloader_for_topology(known.topology)
         except UsbTopologyError as err:
             raise FlashError(str(err)) from err
-        if (
-            bootloader is not None
-            and known.usb_serial is not None
-            and bootloader.usb_serial is not None
-            and known.usb_serial != bootloader.usb_serial
-            and known.version is not None
-        ):
+        if bootloader is not None and self._has_changed_usb_serial(known, bootloader):
+            if self._handoff_descriptor_change_is_current(known):
+                return bootloader
+            if known.recovery_binding == RECOVERY_BINDING_HANDOFF_PENDING:
+                raise FlashError(
+                    "saved CUL DFU handoff expired or has an invalid time window; "
+                    "explicit recovery confirmation is required"
+                )
             raise FlashError(
-                "DFU device on the saved USB path has a different USB serial number; refusing recovery"
+                "DFU device on the saved USB path has a different USB serial number; "
+                "explicit recovery confirmation is required"
             )
         return bootloader
+
+    def _handoff_descriptor_change_is_current(self, known: KnownDevice) -> bool:
+        """Allow one app-to-DFU descriptor change only in its bounded handoff window."""
+
+        now = int(self._time())
+        return (
+            known.recovery_binding == RECOVERY_BINDING_HANDOFF_PENDING
+            and known.handoff_deadline is not None
+            # A persisted timestamp far in the future may be stale or corrupt.
+            # Fail closed rather than turning a bounded B01 handoff into an
+            # indefinite authorization for a different DFU descriptor.
+            and 0 <= known.handoff_deadline - now <= self._post_dfu_timeout()
+        )
+
+    @staticmethod
+    def _has_changed_usb_serial(known: KnownDevice, target: UsbTarget) -> bool:
+        return (
+            known.usb_serial is not None
+            and target.usb_serial is not None
+            and known.usb_serial != target.usb_serial
+        )
 
     def _single_unpaired_recovery_target(self) -> ManualRecoveryTarget | None:
         """Offer recovery only when one expected bootloader is unambiguous."""
@@ -1040,6 +1096,26 @@ class Cul868Flasher:
             return
         report(25 if target == "USB DFU bootloader" else 84, f"Waiting for {target} USB re-enumeration.")
         self._sleep(_QEMU_SETTLE_SECONDS)
+
+    @staticmethod
+    def _unpaired_bootloader_status(
+        manual_recovery: ManualRecoveryTarget, reason: str | None = None
+    ) -> dict[str, object]:
+        """Describe the one bootloader that still requires an operator decision."""
+
+        message = (
+            "One unpaired CUL868 DFU bootloader is present. Validate firmware, then explicitly "
+            "confirm that this is the configured CUL868 before recovery."
+        )
+        if reason is not None:
+            message = f"{reason}. {message}"
+        return {
+            "state": "unpaired_bootloader",
+            "topology": manual_recovery.topology,
+            "usb_serial": manual_recovery.usb_serial,
+            "last_verified_version": None,
+            "message": message,
+        }
 
     @staticmethod
     def _status_error(known: KnownDevice | None, message: str) -> dict[str, object]:

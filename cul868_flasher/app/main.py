@@ -38,9 +38,9 @@ def run() -> None:
     settings = Settings.from_mapping(_load_options())
     controller = OperationController()
     flasher = Cul868Flasher(settings)
-    api = IngressApi(controller, flasher)
-    server = IngressServer(api)
     stopping = Event()
+    api = IngressApi(controller, flasher, stopping=stopping)
+    server = IngressServer(api)
 
     def request_stop(signum: int, _frame: object) -> None:
         if not stopping.is_set():
@@ -57,6 +57,10 @@ def run() -> None:
             if operation is None:
                 continue
             operation_id = operation.operation_id
+            if stopping.is_set():
+                controller.discard_queued(operation_id)
+                api.discard_image(operation.image)
+                break
             controller.mark_running(operation_id)
             try:
                 result = flasher.flash(
@@ -87,9 +91,11 @@ def run() -> None:
             finally:
                 api.discard_image(operation.image)
     finally:
+        api.close_admission()
+        server.stop()
         for pending in controller.drain():
             api.discard_image(pending.image)
-        server.stop()
+        api.close()
 
 
 def _verify_startup_firmware(flasher: Cul868Flasher) -> None:

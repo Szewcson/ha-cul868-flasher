@@ -141,6 +141,85 @@ class IngressApiTests(unittest.TestCase):
                 api.validate_upload(io.BytesIO(b"not a firmware"), len(b"not a firmware"))
             self.assertEqual(list(temporary_directory.iterdir()), [])
 
+    def test_shutdown_admission_rejects_a_staged_flash_and_removes_it(self) -> None:
+        controller = OperationController()
+        with tempfile.TemporaryDirectory() as directory:
+            temporary_directory = Path(directory)
+            api = IngressApi(controller, _IngressFlasher(), temporary_directory)  # type: ignore[arg-type]
+            response = api.validate_upload(io.BytesIO(minimal_hex()), len(minimal_hex()))
+
+            api.close_admission()
+            with self.assertRaisesRegex(IngressError, "is stopping"):
+                api.flash(response["artifact_id"], True, None)
+            api.close()
+
+            self.assertEqual(list(temporary_directory.iterdir()), [])
+
+    def test_shutdown_signal_rejects_new_mutations_before_main_cleanup(self) -> None:
+        controller = OperationController()
+        stopping = Event()
+        with tempfile.TemporaryDirectory() as directory:
+            temporary_directory = Path(directory)
+            api = IngressApi(
+                controller,
+                _IngressFlasher(),  # type: ignore[arg-type]
+                temporary_directory,
+                stopping,
+            )
+
+            stopping.set()
+            with self.assertRaisesRegex(IngressError, "is stopping"):
+                api.validate_upload(io.BytesIO(minimal_hex()), len(minimal_hex()))
+
+            self.assertEqual(list(temporary_directory.iterdir()), [])
+
+    def test_shutdown_rejects_validation_that_finishes_after_admission_closes(self) -> None:
+        class BlockingPreflightFlasher(_IngressFlasher):
+            def __init__(self) -> None:
+                super().__init__()
+                self.started = Event()
+                self.release = Event()
+
+            def preflight(self) -> FlashPreflight:
+                self.started.set()
+                self.release.wait(timeout=2)
+                return super().preflight()
+
+        controller = OperationController()
+        flasher = BlockingPreflightFlasher()
+        with tempfile.TemporaryDirectory() as directory:
+            temporary_directory = Path(directory)
+            api = IngressApi(controller, flasher, temporary_directory)  # type: ignore[arg-type]
+            errors: list[Exception] = []
+
+            def validate() -> None:
+                try:
+                    api.validate_upload(io.BytesIO(minimal_hex()), len(minimal_hex()))
+                except Exception as err:  # noqa: BLE001 - assert the public API failure
+                    errors.append(err)
+
+            thread = Thread(target=validate)
+            thread.start()
+            self.assertTrue(flasher.started.wait(timeout=1))
+            api.close_admission()
+            flasher.release.set()
+            thread.join(timeout=2)
+
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(len(errors), 1)
+            self.assertIsInstance(errors[0], IngressError)
+            self.assertEqual(list(temporary_directory.iterdir()), [])
+
+    def test_server_stop_closes_mutating_request_admission(self) -> None:
+        controller = OperationController()
+        with tempfile.TemporaryDirectory() as directory:
+            api = IngressApi(controller, _IngressFlasher(), Path(directory))  # type: ignore[arg-type]
+            server = IngressServer(api, port=0)
+            server.stop()
+            with self.assertRaisesRegex(IngressError, "is stopping"):
+                api.validate_upload(io.BytesIO(minimal_hex()), len(minimal_hex()))
+            api.close()
+
 
 class IngressServerTests(unittest.TestCase):
     def test_mutating_requests_require_ingress_header(self) -> None:

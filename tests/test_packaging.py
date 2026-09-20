@@ -48,6 +48,16 @@ class PackagingTests(unittest.TestCase):
         self.assertIn("aarch64-base:3.24@sha256:", build)
         self.assertIn("amd64-base:3.24@sha256:", build)
 
+    def test_ci_actions_are_immutable_commit_pins(self) -> None:
+        workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+
+        self.assertIn(
+            "actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09", workflow
+        )
+        self.assertIn(
+            "actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1", workflow
+        )
+
     def test_docker_context_excludes_generated_python_bytecode(self) -> None:
         ignore = (ROOT / "cul868_flasher" / ".dockerignore").read_text(encoding="utf-8")
         self.assertIn("__pycache__/", ignore)

@@ -40,7 +40,7 @@ h2 { margin-bottom: .5rem; font-size: clamp(1.45rem, 4vw, 2rem); line-height: 1;
 h3 { margin: .2rem 0 .8rem; font-size: 1.2rem; }
 .lede, .section-heading > p, [data-device-message] { color: var(--muted); font-size: 1.05rem; line-height: 1.45; }
 
-.device-card, .flash-card, .operation-card {
+.device-card, .led-card, .flash-card, .operation-card {
   margin-bottom: 1.25rem;
   border: 1px solid var(--line);
   border-radius: .35rem;
@@ -53,7 +53,7 @@ h3 { margin: .2rem 0 .8rem; font-size: 1.2rem; }
 .device-card dl { min-width: 12rem; margin: 0; font: .8rem/1.4 ui-monospace, monospace; }
 .device-card dl div + div { margin-top: .75rem; }
 dt { color: var(--muted); } dd { margin: 0; overflow-wrap: anywhere; }
-.flash-card, .operation-card { padding: clamp(1.25rem, 4vw, 2.1rem); }
+.led-card, .flash-card, .operation-card { padding: clamp(1.25rem, 4vw, 2.1rem); }
 .file-picker { display: block; margin: 1.5rem 0 .85rem; padding: 1rem; border: 1px dashed var(--moss); background: var(--moss-pale); cursor: pointer; }
 .file-picker span { display: block; margin-bottom: .5rem; font: 700 .75rem/1 ui-monospace, monospace; text-transform: uppercase; letter-spacing: .08em; }
 input[type="file"] { width: 100%; }
@@ -61,6 +61,7 @@ button { border: 0; border-radius: .2rem; padding: .85rem 1.05rem; color: #fff; 
 button:hover:not(:disabled) { filter: brightness(.9); }
 button:disabled { cursor: not-allowed; opacity: .48; }
 button.danger { background: var(--signal-dark); }
+.button-row { display: flex; flex-wrap: wrap; gap: .75rem; margin-top: 1.25rem; }
 .notice { margin-top: 1rem; padding: .85rem 1rem; border-left: .3rem solid var(--moss); background: var(--moss-pale); line-height: 1.4; }
 .confirmation { margin-top: 1.5rem; padding-top: 1.5rem; border-top: 1px solid var(--line); }
 .checkbox { display: flex; gap: .65rem; align-items: flex-start; margin: 1rem 0; line-height: 1.3; }

@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from queue import Empty, Full, Queue
 from secrets import token_hex
-from threading import Lock
+from threading import Event, Lock
 from time import time
 
 from .hexfile import HexImage
@@ -98,13 +98,23 @@ class OperationController:
                 raise ValueError("only a queued flash operation can be discarded")
             self._discard_queued_locked("Queued firmware was discarded during shutdown.")
 
-    def mark_running(self, operation_id: str) -> None:
+    def claim_for_run(self, operation_id: str, stopping: Event) -> bool:
+        """Atomically either claim queued work or discard it after shutdown.
+
+        A caller that receives ``True`` owns the current non-interruptible
+        flash. Signal handlers only set ``stopping`` and never take this lock,
+        so they cannot deadlock the worker while it makes this transition.
+        """
+
         with self._lock:
             self._require_current(operation_id)
-            self._status = "running"
-            self._progress = max(self._progress, 1)
-            self._message = "Preparing the CUL868 flash operation."
-            self._append_event("running", self._message)
+            if self._status != "queued":
+                raise ValueError("only a queued flash operation can be started")
+            if stopping.is_set():
+                self._discard_queued_locked("Queued firmware was discarded during shutdown.")
+                return False
+            self._mark_running_locked()
+            return True
 
     def report_progress(self, operation_id: str, percent: int, message: str) -> None:
         if not isinstance(percent, int) or not 0 <= percent <= 100:
@@ -160,6 +170,12 @@ class OperationController:
         self._message = "No flash operation is running."
         self._error = None
         self._append_event("discarded", message)
+
+    def _mark_running_locked(self) -> None:
+        self._status = "running"
+        self._progress = max(self._progress, 1)
+        self._message = "Preparing the CUL868 flash operation."
+        self._append_event("running", self._message)
 
     def _append_event(self, kind: str, message: str) -> None:
         self._events.append({"at": int(time()), "kind": kind, "message": message})

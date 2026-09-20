@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from threading import Event
 
 from app.hexfile import parse_hex_file
 from app.operation import OperationBusyError, OperationController
@@ -22,7 +23,7 @@ class OperationTests(unittest.TestCase):
                 controller.submit("another", image)
             queued = controller.get(timeout=0)
             self.assertEqual(queued, operation)
-            controller.mark_running(operation.operation_id)
+            self.assertTrue(controller.claim_for_run(operation.operation_id, Event()))
             controller.report_progress(operation.operation_id, 40, "Writing")
             controller.report_progress(operation.operation_id, 30, "Older update")
             controller.complete(operation.operation_id, "Verified")
@@ -43,7 +44,7 @@ class OperationTests(unittest.TestCase):
             self.assertEqual(pending, (operation,))
 
             replacement = controller.submit("replacement", image)
-            controller.mark_running(replacement.operation_id)
+            self.assertTrue(controller.claim_for_run(replacement.operation_id, Event()))
             error = RuntimeError("firmware transfer failed")
             error.add_note("wmbusmeters could not be restored: wmbusmeters: start failed")
             controller.fail(replacement.operation_id, error)
@@ -65,4 +66,21 @@ class OperationTests(unittest.TestCase):
         snapshot = controller.snapshot()
         self.assertEqual(snapshot["status"], "idle")
         self.assertEqual(snapshot["operation_id"], None)
+        self.assertEqual(snapshot["events"][-1]["kind"], "discarded")
+
+    def test_claim_discards_a_dequeued_operation_when_shutdown_is_observed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "firmware.hex"
+            path.write_bytes(minimal_hex())
+            image = parse_hex_file(path)
+            controller = OperationController()
+            operation = controller.submit("artifact", image)
+            self.assertEqual(controller.get(timeout=0), operation)
+            stopping = Event()
+            stopping.set()
+
+            self.assertFalse(controller.claim_for_run(operation.operation_id, stopping))
+
+        snapshot = controller.snapshot()
+        self.assertEqual(snapshot["status"], "idle")
         self.assertEqual(snapshot["events"][-1]["kind"], "discarded")

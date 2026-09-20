@@ -101,7 +101,7 @@ class SupervisorLifecycleTests(unittest.TestCase):
         self.assertEqual(supervisor.events, ["stop:a0d7b954_wmbusmeters"])
         self.assertIn("CUL consumer add-ons remain stopped", "\n".join(caught.exception.__notes__))
 
-    def test_retains_only_opted_in_external_app_after_alias_migration(self) -> None:
+    def test_retains_all_matching_apps_after_alias_change(self) -> None:
         class MultiConsumerSupervisor(SupervisorClient):
             def __init__(self) -> None:
                 self.states = {
@@ -137,16 +137,16 @@ class SupervisorLifecycleTests(unittest.TestCase):
         with supervisor.temporarily_stop_cul_consumers(
             Path("/dev/ttyACM0"), ("local_homegear",)
         ) as pause:
-            pause.retain_addons(pause.additional_addons)
+            pause.retain_addons(pause.addons)
 
         self.assertEqual(
             supervisor.events,
             [
                 "stop:a0d7b954_wmbusmeters",
                 "stop:local_homegear",
-                "start:a0d7b954_wmbusmeters",
             ],
         )
+        self.assertEqual(supervisor.states["a0d7b954_wmbusmeters"], "stopped")
         self.assertEqual(supervisor.states["local_homegear"], "stopped")
 
     def test_matches_only_direct_path_and_serial_discovery_modes(self) -> None:
@@ -258,96 +258,3 @@ class SupervisorLifecycleTests(unittest.TestCase):
         client = SupervisorClient.__new__(SupervisorClient)
         with self.assertRaisesRegex(SupervisorError, "outside /dev/ttyACM"):
             client.hardware_serial_by_id_paths_for_tty(Path("/dev/serial/by-id/cul868"))
-
-    def test_retargets_only_exact_paused_by_id_paths_and_own_option(self) -> None:
-        previous = Path("/dev/serial/by-id/usb-busware.de_CUL868-old-if00")
-        current = Path("/dev/serial/by-id/usb-busware.de_CUL868-new-if00")
-
-        class OptionsSupervisor(SupervisorClient):
-            def __init__(self) -> None:
-                self.options: dict[str, dict[str, object]] = {
-                    "self": {"device": str(previous), "baudrate": 9_600},
-                    "a0d7b954_wmbusmeters": {
-                        "conf": {
-                            "device": f"MAIN= {previous} :cul:t1; auto:t1",
-                            "loglevel": "normal",
-                        },
-                        "mqtt": {"username": "not logged"},
-                    },
-                    "f591d177_max2mqtt": {
-                        "serial_port": str(previous),
-                        "mqtt_password": "not logged",
-                    },
-                }
-                self.requests: list[tuple[str, str, dict[str, object] | None]] = []
-
-            def _request(
-                self, method: str, path: str, payload: dict[str, object] | None = None
-            ) -> dict[str, object]:
-                self.requests.append((method, path, payload))
-                if method == "GET" and path.endswith("/info"):
-                    slug = path.removeprefix("/addons/").removesuffix("/info")
-                    return {"data": {"options": self.options[slug]}}
-                if method == "POST" and path.endswith("/options"):
-                    slug = path.removeprefix("/addons/").removesuffix("/options")
-                    assert payload is not None
-                    options = payload.get("options")
-                    assert isinstance(options, dict)
-                    self.options[slug] = options
-                    return {"result": "ok"}
-                raise AssertionError(f"unexpected Supervisor request: {method} {path}")
-
-        supervisor = OptionsSupervisor()
-        pause = CulConsumerPause(
-            wmbusmeters_addons=("a0d7b954_wmbusmeters",),
-            max2mqtt_addons=("f591d177_max2mqtt",),
-        )
-
-        retargeted = supervisor.retarget_paused_cul_consumers(pause, previous, current)
-        self.assertEqual(
-            retargeted.wmbusmeters_addons,
-            ("a0d7b954_wmbusmeters",),
-        )
-        self.assertEqual(retargeted.max2mqtt_addons, ("f591d177_max2mqtt",))
-        self.assertTrue(supervisor.retarget_own_device_path(previous, current))
-        self.assertEqual(supervisor.options["self"]["device"], str(current))
-        self.assertEqual(
-            supervisor.options["a0d7b954_wmbusmeters"]["conf"],
-            {
-                "device": f"MAIN= {current} :cul:t1; auto:t1",
-                "loglevel": "normal",
-            },
-        )
-        self.assertEqual(supervisor.options["f591d177_max2mqtt"]["serial_port"], str(current))
-        self.assertEqual(
-            [(method, path) for method, path, _payload in supervisor.requests],
-            [
-                ("GET", "/addons/a0d7b954_wmbusmeters/info"),
-                ("POST", "/addons/a0d7b954_wmbusmeters/options"),
-                ("GET", "/addons/f591d177_max2mqtt/info"),
-                ("POST", "/addons/f591d177_max2mqtt/options"),
-                ("GET", "/addons/self/info"),
-                ("POST", "/addons/self/options"),
-            ],
-        )
-
-    def test_does_not_overwrite_a_different_own_device_option(self) -> None:
-        previous = Path("/dev/serial/by-id/usb-busware.de_CUL868-old-if00")
-        current = Path("/dev/serial/by-id/usb-busware.de_CUL868-new-if00")
-
-        class ChangedOptionsSupervisor(SupervisorClient):
-            def __init__(self) -> None:
-                self.requests: list[tuple[str, str]] = []
-
-            def _request(
-                self, method: str, path: str, _payload: dict[str, object] | None = None
-            ) -> dict[str, object]:
-                self.requests.append((method, path))
-                if method == "GET":
-                    return {"data": {"options": {"device": "/dev/ttyACM9"}}}
-                raise AssertionError("the changed option must not be overwritten")
-
-        supervisor = ChangedOptionsSupervisor()
-
-        self.assertFalse(supervisor.retarget_own_device_path(previous, current))
-        self.assertEqual(supervisor.requests, [("GET", "/addons/self/info")])

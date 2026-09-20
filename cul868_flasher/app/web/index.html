@@ -27,6 +27,19 @@
         </dl>
       </section>
 
+      <section class="led-card" aria-labelledby="led-heading">
+        <div class="section-heading">
+          <p class="eyebrow">Optional control</p>
+          <h2 id="led-heading">CULFW indicator LED</h2>
+          <p>Available after a recorded <code>V ... CUL868</code> response from CULFW or a-culfw. Each action verifies the device again before sending the command. TSCULFW is intentionally not controlled.</p>
+        </div>
+        <div class="button-row">
+          <button type="button" class="secondary" data-led-on disabled>Turn LED on</button>
+          <button type="button" class="secondary" data-led-off disabled>Turn LED off</button>
+        </div>
+        <p class="notice" hidden data-led-result></p>
+      </section>
+
       <section class="flash-card" aria-labelledby="flash-heading">
         <div class="section-heading">
           <p class="eyebrow">Step 1</p>

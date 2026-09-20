@@ -27,8 +27,20 @@ _READ_LIMIT = 2 * 1024
 _VERSION_PREFIXES = (b"V ", b"VTS ")
 
 
+def supports_culfw_led_control(version: str) -> bool:
+    """Return whether a verified version has CULFW's documented LED command.
+
+    The CULFW/a-culfw protocol uses ``V ... CUL868`` and documents ``l00``
+    and ``l01`` for LED control. TSCULFW identifies itself with ``VTS ...``;
+    it is deliberately excluded because this add-on has no verified command
+    contract for its LED implementation.
+    """
+
+    return version.startswith("V ") and "CUL868" in version
+
+
 class CulSerial:
-    """Own a short exclusive CDC session and expose only the two needed commands."""
+    """Own a short exclusive CDC session and expose the required CUL commands."""
 
     def __init__(self, device: Path, baudrate: int, timeout: float = 3.0) -> None:
         self._device = device
@@ -110,6 +122,22 @@ class CulSerial:
         except (OSError, termios.error) as err:
             if getattr(err, "errno", None) not in {errno.EIO, errno.ENODEV}:
                 raise CulSerialError(f"CUL bootloader command could not drain: {err}") from err
+
+    def set_led(self, enabled: bool) -> None:
+        """Send CULFW's documented LED command after the caller verified ``V``.
+
+        CULFW does not echo commands, so draining the serial buffer only proves
+        that the command reached the kernel; it is not a readback of LED state.
+        """
+
+        if not isinstance(enabled, bool):
+            raise CulSerialError("CUL LED state must be a boolean")
+        self._write_all(b"l01\r\n" if enabled else b"l00\r\n")
+        descriptor = self._require_descriptor()
+        try:
+            termios.tcdrain(descriptor)
+        except (OSError, termios.error) as err:
+            raise CulSerialError(f"CUL LED command could not drain: {err}") from err
 
     def _request_version_line(self) -> str:
         """Return one supported CUL version line after the documented CRLF request."""

@@ -9,6 +9,9 @@ const unpairedRecoveryConfirmation = document.querySelector("[data-unpaired-reco
 const unpairedRecoveryBox = document.querySelector("[data-confirm-unpaired-recovery]");
 const flashButton = document.querySelector("[data-flash]");
 const preflight = document.querySelector("[data-preflight]");
+const ledOnButton = document.querySelector("[data-led-on]");
+const ledOffButton = document.querySelector("[data-led-off]");
+const ledResult = document.querySelector("[data-led-result]");
 let artifactId = null;
 let requiresUnpairedRecovery = false;
 
@@ -39,6 +42,18 @@ function updateFlashButton() {
   flashButton.disabled = !artifactId || !confirmationBox.checked || (requiresUnpairedRecovery && !unpairedRecoveryBox.checked);
 }
 
+function supportsLedControl(device) {
+  const version = device.last_verified_version;
+  return device.state === "application" && typeof version === "string" && version.startsWith("V ") && version.includes("CUL868");
+}
+
+function updateLedControls(device, operation) {
+  const busy = operation.status === "queued" || operation.status === "running";
+  const enabled = supportsLedControl(device) && !busy;
+  ledOnButton.disabled = !enabled;
+  ledOffButton.disabled = !enabled;
+}
+
 async function refresh() {
   try {
     const status = await request("api/status", { headers: {} });
@@ -47,10 +62,13 @@ async function refresh() {
     setText("[data-device-message]", device.message);
     setText("[data-topology]", device.topology);
     setText("[data-version]", device.last_verified_version);
-    updateOperation(status.operation || {});
+    const operation = status.operation || {};
+    updateOperation(operation);
+    updateLedControls(device, operation);
   } catch (error) {
     setText("[data-device-state]", "Status unavailable");
     setText("[data-device-message]", error.message);
+    updateLedControls({}, {});
   }
 }
 
@@ -141,6 +159,29 @@ flashButton.addEventListener("click", async () => {
     updateFlashButton();
   }
 });
+
+async function setLed(enabled) {
+  if ((enabled && ledOnButton.disabled) || (!enabled && ledOffButton.disabled)) return;
+  ledOnButton.disabled = true;
+  ledOffButton.disabled = true;
+  ledResult.hidden = false;
+  ledResult.textContent = `Sending CULFW LED ${enabled ? "on" : "off"} command...`;
+  try {
+    const payload = await request("api/led", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled }),
+    });
+    ledResult.textContent = payload.message || `CULFW LED ${enabled ? "on" : "off"} command sent.`;
+  } catch (error) {
+    ledResult.textContent = error.message;
+  } finally {
+    refresh();
+  }
+}
+
+ledOnButton.addEventListener("click", () => setLed(true));
+ledOffButton.addEventListener("click", () => setLed(false));
 
 refresh();
 window.setInterval(refresh, 2000);

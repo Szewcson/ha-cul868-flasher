@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from app.serial import CulSerial
+from app.serial import CulSerial, supports_culfw_led_control
 
 
 class CulSerialTests(unittest.TestCase):
@@ -29,3 +29,24 @@ class CulSerialTests(unittest.TestCase):
 
         self.assertEqual(version, "V 1.67 CUL868")
         write_all.assert_called_once_with(b"V\r\n")
+
+    def test_led_control_is_limited_to_the_standard_culfw_v_response(self) -> None:
+        self.assertTrue(supports_culfw_led_control("V 1.67 CUL868"))
+        self.assertTrue(
+            supports_culfw_led_control("V 1.26.08 a-culfw Build: test CUL868 (F-Band: 868MHz)")
+        )
+        self.assertFalse(supports_culfw_led_control("VTS 0.43 CUL868"))
+
+    def test_led_command_uses_documented_lowercase_modes_and_crlf(self) -> None:
+        serial = CulSerial(Path("/dev/ttyACM0"), 9_600)
+        serial._descriptor = 42
+        with (
+            patch.object(serial, "_write_all") as write_all,
+            patch("app.serial.termios.tcdrain") as drain,
+        ):
+            serial.set_led(True)
+            serial.set_led(False)
+
+        self.assertEqual(write_all.call_args_list[0].args, (b"l01\r\n",))
+        self.assertEqual(write_all.call_args_list[1].args, (b"l00\r\n",))
+        self.assertEqual(drain.call_count, 2)

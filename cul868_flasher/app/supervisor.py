@@ -66,9 +66,10 @@ class CulConsumerPause:
     def retain_addons(self, addons: tuple[str, ...]) -> None:
         """Keep named paused consumers stopped after an otherwise successful flash.
 
-        User-named external applications have no stable Supervisor schema for
-        their CUL path. When a firmware changes a serial-by-id alias, restarting
-        one could reopen a stale endpoint, so retain it for an operator review.
+        Firmware can change a serial-by-id alias. The Supervisor option API
+        does not offer an atomic compare-and-set operation, so no consumer
+        configuration is rewritten automatically. Retaining matching apps
+        prevents them from reopening a stale endpoint before operator review.
         """
 
         self._retained_addons.update(set(addons).intersection(self.addons))
@@ -84,21 +85,6 @@ class CulConsumerPause:
         """Return paused consumers deliberately left stopped after success."""
 
         return tuple(sorted(self._retained_addons))
-
-@dataclass(frozen=True)
-class CulConsumerRetarget:
-    """Known consumer settings changed after a verified alias migration."""
-
-    wmbusmeters_addons: tuple[str, ...] = ()
-    max2mqtt_addons: tuple[str, ...] = ()
-
-    @property
-    def addons(self) -> tuple[str, ...]:
-        """Return every consumer whose exact path was migrated."""
-
-        return tuple(sorted(set(self.wmbusmeters_addons + self.max2mqtt_addons)))
-
-
 class SupervisorClient:
     """Use the narrowly scoped Supervisor endpoints required for a safe flash."""
 
@@ -218,56 +204,6 @@ class SupervisorClient:
             f"{slug} did not reach {expected} state before the timeout (last state: {last_state})"
         )
 
-    def retarget_own_device_path(self, previous: Path, current: Path) -> bool:
-        """Replace this add-on path only if it still names the exact old alias.
-
-        The Supervisor options endpoint has no compare-and-set revision token,
-        so this is a best-effort precondition check rather than an atomic
-        transaction with a simultaneous Configuration UI edit.
-        """
-
-        _require_serial_by_id_path(previous)
-        _require_serial_by_id_path(current)
-        options = self._addon_options("self")
-        if options.get("device") != str(previous):
-            return False
-        updated = dict(options)
-        updated["device"] = str(current)
-        self._set_addon_options("self", updated)
-        return True
-
-    def retarget_paused_cul_consumers(
-        self, pause: CulConsumerPause, previous: Path, current: Path
-    ) -> CulConsumerRetarget:
-        """Retarget known paused consumers that still name the old by-id path.
-
-        The options documents can contain credentials. They stay in memory only
-        long enough to replace the one exact serial endpoint and are never logged.
-        """
-
-        _require_serial_by_id_path(previous)
-        _require_serial_by_id_path(current)
-        updated_wmbusmeters: list[str] = []
-        for slug in pause.wmbusmeters_addons:
-            options = self._addon_options(slug)
-            updated = _retarget_wmbusmeters_options(options, previous, current)
-            if updated is None:
-                continue
-            self._set_addon_options(slug, updated)
-            updated_wmbusmeters.append(slug)
-        updated_max2mqtt: list[str] = []
-        for slug in pause.max2mqtt_addons:
-            options = self._addon_options(slug)
-            updated = _retarget_max2mqtt_options(options, previous, current)
-            if updated is None:
-                continue
-            self._set_addon_options(slug, updated)
-            updated_max2mqtt.append(slug)
-        return CulConsumerRetarget(
-            wmbusmeters_addons=tuple(updated_wmbusmeters),
-            max2mqtt_addons=tuple(updated_max2mqtt),
-        )
-
     @contextmanager
     def temporarily_stop_cul_consumers(
         self, device: Path, additional_cul_addons: tuple[str, ...]
@@ -341,24 +277,9 @@ class SupervisorClient:
         document = self._request("GET", f"/addons/{_addon_path(slug)}/info")
         return _require_mapping(document.get("data"), f"add-on {slug}")
 
-    def _addon_options(self, slug: str) -> dict[str, Any]:
-        return _require_mapping(self._addon_info(slug).get("options"), f"add-on {slug} options")
-
-    def _set_addon_options(self, slug: str, options: dict[str, Any]) -> None:
-        self._request("POST", f"/addons/{_addon_path(slug)}/options", {"options": options})
-
-    def _request(
-        self, method: str, path: str, payload: dict[str, Any] | None = None
-    ) -> dict[str, Any]:
-        data: bytes | None = None
-        if payload is not None:
-            try:
-                data = json.dumps(payload, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
-            except (TypeError, ValueError) as err:
-                raise SupervisorError(f"Supervisor request {method} {path} has invalid JSON") from err
+    def _request(self, method: str, path: str) -> dict[str, Any]:
         request = Request(
             self._base_url + path,
-            data=data,
             method=method,
             headers={
                 "Authorization": f"Bearer {self._token}",
@@ -481,80 +402,6 @@ def _same_device_path(candidate: str, selected_device: Path) -> bool:
         return candidate_path.resolve(strict=True) == selected_device.resolve(strict=True)
     except OSError:
         return False
-
-
-def _retarget_wmbusmeters_options(
-    options: object, previous: Path, current: Path
-) -> dict[str, Any] | None:
-    """Copy options while replacing exact direct CUL endpoints, if any."""
-
-    if not isinstance(options, dict):
-        raise SupervisorError("wmbusmeters returned invalid options")
-    configuration = options.get("conf")
-    if isinstance(configuration, dict):
-        section = configuration
-        section_name = "conf"
-    else:
-        section = options
-        section_name = None
-    value = section.get("device")
-    replacement = _retarget_wmbusmeters_device_value(value, previous, current)
-    if replacement is None:
-        return None
-    updated = dict(options)
-    updated_section = dict(section)
-    updated_section["device"] = replacement
-    if section_name is None:
-        updated = updated_section
-    else:
-        updated[section_name] = updated_section
-    return updated
-
-
-def _retarget_wmbusmeters_device_value(
-    value: object, previous: Path, current: Path
-) -> str | None:
-    if not isinstance(value, str) or len(value) > 4_096 or "\x00" in value:
-        return None
-    specifications = value.split(";")
-    replacements = [
-        _retarget_wmbusmeters_device_spec(specification, previous, current)
-        for specification in specifications
-    ]
-    if replacements == specifications:
-        return None
-    return ";".join(replacements)
-
-
-def _retarget_wmbusmeters_device_spec(specification: str, previous: Path, current: Path) -> str:
-    """Replace only the endpoint portion, retaining aliases and mode suffixes."""
-
-    alias, separator, value = specification.partition("=")
-    prefix = f"{alias}{separator}" if separator else ""
-    if not separator:
-        value = specification
-    endpoint, suffix_separator, suffix = value.partition(":")
-    if endpoint.strip() != str(previous):
-        return specification
-    leading_length = len(endpoint) - len(endpoint.lstrip())
-    trailing_length = len(endpoint) - len(endpoint.rstrip())
-    leading = endpoint[:leading_length]
-    trailing = endpoint[len(endpoint) - trailing_length :] if trailing_length else ""
-    return f"{prefix}{leading}{current}{trailing}{suffix_separator}{suffix}"
-
-
-def _retarget_max2mqtt_options(
-    options: object, previous: Path, current: Path
-) -> dict[str, Any] | None:
-    """Copy MAX! to MQTT Bridge options while replacing only its exact port."""
-
-    if not isinstance(options, dict):
-        raise SupervisorError("max2mqtt returned invalid options")
-    if options.get("serial_port") != str(previous):
-        return None
-    updated = dict(options)
-    updated["serial_port"] = str(current)
-    return updated
 
 
 def _quote_slug(slug: str) -> str:

@@ -57,11 +57,9 @@ def run() -> None:
             if operation is None:
                 continue
             operation_id = operation.operation_id
-            if stopping.is_set():
-                controller.discard_queued(operation_id)
+            if not controller.claim_for_run(operation_id, stopping):
                 api.discard_image(operation.image)
                 break
-            controller.mark_running(operation_id)
             try:
                 result = flasher.flash(
                     operation.image,
@@ -76,17 +74,38 @@ def run() -> None:
             else:
                 installed = result.get("installed_version")
                 LOGGER.info("Verified CUL868 firmware: %s", installed)
-                retained = result.get("stopped_additional_cul_addons")
+                retained = result.get("stopped_cul_addons")
                 if isinstance(retained, list) and all(isinstance(slug, str) for slug in retained):
                     retained_message = (
-                        "; additional CUL apps remain stopped for a manual serial-path review: "
+                        "; CUL apps remain stopped for a manual serial-path review: "
                         + ", ".join(retained)
                     )
                 else:
                     retained_message = ""
+                migration = result.get("manual_serial_path_migration")
+                if isinstance(migration, dict):
+                    current = migration.get("current")
+                    endpoint = migration.get("application_endpoint")
+                    if isinstance(current, str):
+                        migration_message = (
+                            "; CUL serial-by-id name changed to "
+                            f"{current}; update this add-on and paused CUL app settings manually"
+                        )
+                    elif isinstance(endpoint, str):
+                        migration_message = (
+                            "; CUL serial-by-id name needs manual resolution; the verified endpoint is "
+                            f"{endpoint}"
+                        )
+                    else:
+                        migration_message = "; CUL serial-by-id name needs manual resolution"
+                else:
+                    migration_message = ""
                 controller.complete(
                     operation_id,
-                    f"CUL868 firmware verified: {installed or 'version unavailable'}{retained_message}",
+                    (
+                        f"CUL868 firmware verified: {installed or 'version unavailable'}"
+                        f"{migration_message}{retained_message}"
+                    ),
                 )
             finally:
                 api.discard_image(operation.image)

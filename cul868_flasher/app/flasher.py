@@ -9,7 +9,7 @@ import subprocess
 import tempfile
 from collections.abc import Callable
 from contextlib import AbstractContextManager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
 from time import monotonic, sleep, time
@@ -17,7 +17,7 @@ from typing import Protocol, Self
 
 from .hexfile import HexImage, parse_hex_file
 from .models import Settings
-from .serial import CulSerial
+from .serial import CulSerial, supports_culfw_led_control
 from .state import (
     RECOVERY_BINDING_HANDOFF_PENDING,
     RECOVERY_BINDING_OBSERVED_BOOTLOADER,
@@ -25,7 +25,7 @@ from .state import (
     DeviceStateStore,
     KnownDevice,
 )
-from .supervisor import CulConsumerPause, CulConsumerRetarget, SupervisorClient, SupervisorError
+from .supervisor import CulConsumerPause, SupervisorClient, SupervisorError
 from .usb import ManualRecoveryTarget, UsbTarget, UsbTopology, UsbTopologyError
 
 _DFU_EXECUTABLE = "/usr/local/bin/dfu-programmer"
@@ -38,6 +38,7 @@ _VERSION_READ_ATTEMPTS = 3
 _VERSION_RETRY_SECONDS = 1
 _SERIAL_BY_ID_SETTLE_SECONDS = 15
 _SERIAL_BY_ID_POLL_SECONDS = 1
+_SERIAL_BY_ID_DIRECTORY = Path("/dev/serial/by-id")
 
 
 class FlashError(RuntimeError):
@@ -58,6 +59,8 @@ class SerialSession(Protocol):
     def version(self) -> str: ...
 
     def enter_bootloader(self) -> None: ...
+
+    def set_led(self, enabled: bool) -> None: ...
 
 
 SerialFactory = Callable[[Path, int], AbstractContextManager[SerialSession]]
@@ -120,25 +123,11 @@ class Cul868Flasher:
         self._monotonic = monotonic_fn
         self._time = time_fn
         self._flash_lock = Lock()
-        # Settings instances are immutable. Guard replacing the instance after
-        # a verified firmware descriptor change so status readers see one
-        # complete configuration, never a partially updated path.
-        self._settings_lock = Lock()
 
     def _settings_snapshot(self) -> Settings:
-        """Return the immutable settings instance currently used by the worker."""
+        """Return immutable Supervisor settings loaded at process startup."""
 
-        with self._settings_lock:
-            return self._settings
-
-    def _replace_configured_device(self, previous: Path, current: Path) -> bool:
-        """Apply a Supervisor-persisted path migration to the live worker safely."""
-
-        with self._settings_lock:
-            if self._settings.device != previous:
-                return False
-            self._settings = replace(self._settings, device=current)
-            return True
+        return self._settings
 
     def status(self) -> dict[str, object]:
         """Report USB presence without opening the serial device or stopping apps."""
@@ -235,14 +224,15 @@ class Cul868Flasher:
         with self._flash_lock:
             settings = self._settings_snapshot()
             try:
-                application = self._topology.configured_application(settings.device)
-            except UsbTopologyError as err:
-                raise FlashError(f"configured CUL application is unavailable: {err}") from err
-            try:
+                # Check USB application presence before disrupting a consumer.
+                # The endpoint is bound again after the stop because either USB
+                # personality can still change while Supervisor processes exit.
+                self._configured_application_endpoint(settings)
                 with self._supervisor.temporarily_stop_cul_consumers(
                     settings.device, settings.additional_cul_addons
                 ):
-                    version = self._read_version(settings.device)
+                    application, device = self._configured_application_endpoint(settings)
+                    version = self._read_version(device, settings.baudrate)
                     self._state.save(
                         KnownDevice(
                             application.topology,
@@ -257,6 +247,58 @@ class Cul868Flasher:
             except Exception as err:
                 raise FlashError(f"could not verify the running CUL868 firmware: {err}") from err
             return version
+
+    def set_led(self, enabled: bool) -> dict[str, object]:
+        """Send a guarded CULFW LED command to the configured application.
+
+        The command is intentionally serialized with flashing and takes the
+        same exclusive serial ownership path. A final ``V`` response proves a
+        CUL868 is present immediately before the command; it does not prove a
+        persistent LED state because CULFW does not provide command readback.
+        """
+
+        if not isinstance(enabled, bool):
+            raise FlashError("CUL LED state must be a boolean")
+        with self._flash_lock:
+            settings = self._settings_snapshot()
+            try:
+                # Do not interrupt a consumer merely to discover that the CUL
+                # is in DFU or absent. Bind it again after the stop below.
+                self._configured_application_endpoint(settings)
+                with self._supervisor.temporarily_stop_cul_consumers(
+                    settings.device, settings.additional_cul_addons
+                ):
+                    application, device = self._configured_application_endpoint(settings)
+                    with self._serial_factory(device, settings.baudrate) as serial:
+                        version = serial.version()
+                        if not supports_culfw_led_control(version):
+                            if version.startswith("VTS "):
+                                raise FlashError(
+                                    "detected TSCULFW does not expose the documented CULFW LED command"
+                                )
+                            raise FlashError(
+                                "detected CUL firmware does not expose the documented CULFW LED command"
+                            )
+                        serial.set_led(enabled)
+                    self._state.save(
+                        KnownDevice(
+                            application.topology,
+                            application.usb_serial,
+                            version,
+                            str(settings.device),
+                            RECOVERY_BINDING_VERIFIED_APPLICATION,
+                        )
+                    )
+            except FlashError:
+                raise
+            except Exception as err:
+                raise FlashError(f"could not set the CULFW LED: {err}") from err
+            state = "on" if enabled else "off"
+            return {
+                "enabled": enabled,
+                "version": version,
+                "message": f"CULFW LED {state} command was sent after V verification.",
+            }
 
     def flash(
         self,
@@ -284,6 +326,7 @@ class Cul868Flasher:
                     expected_application_serial = plan.application.usb_serial
                     before = self._enter_bootloader(
                         plan,
+                        settings,
                         report,
                         lambda: self._begin_uncertain_transition(
                             plan, pause.leave_stopped_after_error
@@ -347,6 +390,7 @@ class Cul868Flasher:
                         dfu_topology,
                         expected_application_serial,
                         self._post_dfu_timeout(),
+                        settings.baudrate,
                         allow_qemu_topology_change=allow_qemu_topology_change,
                         allow_descriptor_serial_change=True,
                     )
@@ -371,22 +415,12 @@ class Cul868Flasher:
                         RECOVERY_BINDING_VERIFIED_APPLICATION,
                     )
                 )
-                configured_device, retargeted_consumers = self._migrate_serial_by_id_path(
+                manual_serial_path_migration = self._manual_serial_by_id_migration(
                     settings.device,
                     application_device,
                     pause,
                     report,
                 )
-                if configured_device != settings.device:
-                    self._state.save(
-                        KnownDevice(
-                            application.topology,
-                            application.usb_serial,
-                            after,
-                            str(configured_device),
-                            RECOVERY_BINDING_VERIFIED_APPLICATION,
-                        )
-                    )
 
             return {
                 "previous_version": before,
@@ -395,10 +429,9 @@ class Cul868Flasher:
                 "paused_wmbusmeters_addons": list(pause.wmbusmeters_addons),
                 "paused_max2mqtt_addons": list(pause.max2mqtt_addons),
                 "paused_additional_cul_addons": list(pause.additional_addons),
-                "retargeted_wmbusmeters_addons": list(retargeted_consumers.wmbusmeters_addons),
-                "retargeted_max2mqtt_addons": list(retargeted_consumers.max2mqtt_addons),
-                "stopped_additional_cul_addons": list(pause.retained_addons),
-                "device": str(configured_device),
+                "stopped_cul_addons": list(pause.retained_addons),
+                "manual_serial_path_migration": manual_serial_path_migration,
+                "device": str(settings.device),
                 "firmware_sha256": image.sha256,
                 "firmware_bytes": image.data_bytes,
             }
@@ -466,73 +499,61 @@ class Cul868Flasher:
 
         return max(self._settings.boot_timeout, _MIN_POST_DFU_TIMEOUT_SECONDS)
 
-    def _migrate_serial_by_id_path(
+    def _manual_serial_by_id_migration(
         self,
         previous: Path,
         application_device: Path,
         pause: CulConsumerPause,
         report: ProgressReporter,
-    ) -> tuple[Path, CulConsumerRetarget]:
-        """Retarget a changed firmware-owned by-id alias after final verification.
+    ) -> dict[str, str | None] | None:
+        """Report a changed by-id alias without overwriting Supervisor options.
 
         The raw application endpoint was found through the already verified USB
-        topology and has answered ``V``. A firmware can legitimately change USB
-        descriptor strings, which changes its udev ``by-id`` name. Migrate only
-        a direct, unique alias; no alias or multiple aliases are unsafe to guess.
+        topology and has answered ``V``. Firmware can legitimately change USB
+        descriptor strings and therefore its udev ``by-id`` name. The
+        Supervisor option API has no atomic compare-and-set operation, so this
+        add-on never rewrites another app's complete option document. Instead,
+        it retains every paused CUL consumer until the operator updates paths.
         """
 
-        if previous.parent != Path("/dev/serial/by-id"):
-            return previous, CulConsumerRetarget()
+        if previous.parent != _SERIAL_BY_ID_DIRECTORY:
+            return None
         try:
             aliases = self._wait_for_serial_by_id_aliases(application_device, report)
-        except FlashError:
-            pause.leave_stopped_after_error(
-                "the verified CUL serial-by-id path could not be migrated safely"
-            )
-            raise
+        except FlashError as err:
+            aliases = ()
+            reason = f"the new alias could not be inspected: {err}"
+        else:
+            reason = None
         if previous in aliases:
-            return previous, CulConsumerRetarget()
-        if len(aliases) != 1:
-            pause.leave_stopped_after_error(
-                "the verified CUL serial-by-id path could not be migrated safely"
+            return None
+        if len(aliases) == 1:
+            current = aliases[0]
+            report(
+                96,
+                "CUL firmware changed its serial-by-id name; update CUL app paths manually.",
             )
+        else:
+            current = None
             if not aliases:
-                reason = "no /dev/serial/by-id alias points to the verified CUL serial endpoint"
+                reason = reason or (
+                    "no /dev/serial/by-id alias points to the verified CUL serial endpoint"
+                )
             else:
-                reason = "multiple /dev/serial/by-id aliases point to the verified CUL serial endpoint"
-            raise FlashError(
-                "CUL firmware verified, but its serial-by-id path changed and cannot be migrated "
-                f"safely: {reason}; CUL consumer add-ons remain stopped"
-            )
-
-        current = aliases[0]
-        report(94, "CUL firmware changed its USB descriptor; updating its serial-by-id path.")
-        try:
-            retargeted_consumers = self._supervisor.retarget_paused_cul_consumers(
-                pause, previous, current
-            )
-            if not self._supervisor.retarget_own_device_path(previous, current):
-                raise SupervisorError(
-                    "CUL868 flasher device option changed while the flash was in progress"
+                reason = reason or (
+                    "multiple /dev/serial/by-id aliases point to the verified CUL serial endpoint"
                 )
-            if not self._replace_configured_device(previous, current):
-                raise SupervisorError(
-                    "CUL868 flasher runtime device path changed while the flash was in progress"
-                )
-        except Exception as err:
-            pause.leave_stopped_after_error(
-                "the verified CUL serial-by-id path could not be migrated safely"
+            report(
+                96,
+                "CUL firmware changed its serial-by-id name; resolve the new CUL app paths manually.",
             )
-            raise FlashError(
-                "CUL firmware verified, but its serial-by-id path could not be migrated; "
-                "CUL consumer add-ons remain stopped"
-            ) from err
-        if pause.additional_addons:
-            pause.retain_addons(pause.additional_addons)
-            report(96, "Known app paths were updated; additional CUL apps remain stopped.")
-        elif retargeted_consumers.addons:
-            report(96, "Updated matching CUL consumer serial-by-id paths.")
-        return current, retargeted_consumers
+        pause.retain_addons(pause.addons)
+        return {
+            "previous": str(previous),
+            "current": str(current) if current is not None else None,
+            "application_endpoint": str(application_device),
+            "reason": reason,
+        }
 
     def _wait_for_serial_by_id_aliases(
         self, application_device: Path, report: ProgressReporter
@@ -651,6 +672,59 @@ class Cul868Flasher:
                 "the explicitly confirmed DFU bootloader is no longer active; validate the firmware again"
             )
         return _FlashPlan("application", application.topology, application, None, known)
+
+    def _configured_application_endpoint(
+        self,
+        settings: Settings,
+        expected: UsbTarget | None = None,
+    ) -> tuple[UsbTarget, Path]:
+        """Bind a configured alias to one current concrete CUL TTY.
+
+        A direct ``/dev/ttyACM*`` or ``ttyUSB*`` node avoids reopening a
+        mutable ``/dev/serial/by-id`` symlink after a prior topology check.
+        Revalidate the alias and the direct endpoint immediately before each
+        serial operation; a descriptor or topology change before ``B01`` is
+        rejected rather than allowed to target a different CUL.
+        """
+
+        try:
+            configured = self._topology.configured_application(settings.device)
+        except UsbTopologyError as err:
+            raise FlashError(f"configured CUL application is unavailable: {err}") from err
+        if expected is not None and not self._same_application_identity(expected, configured):
+            raise FlashError(
+                "configured CUL USB target changed after validation; validate the target again before "
+                "flashing"
+            )
+        try:
+            device = self._topology.tty_for_topology(configured.topology)
+        except UsbTopologyError as err:
+            raise FlashError(f"could not resolve the verified CUL serial endpoint: {err}") from err
+        if device is None:
+            raise FlashError("the verified CUL serial endpoint disappeared before it could be opened")
+        try:
+            direct = self._topology.configured_application(device)
+        except UsbTopologyError as err:
+            raise FlashError(f"could not revalidate the verified CUL serial endpoint: {err}") from err
+        if not self._same_application_identity(configured, direct):
+            raise FlashError("the verified CUL serial endpoint changed before it could be opened")
+        if expected is not None and not self._same_application_identity(expected, direct):
+            raise FlashError(
+                "configured CUL USB target changed after validation; validate the target again before "
+                "flashing"
+            )
+        return direct, device
+
+    @staticmethod
+    def _same_application_identity(expected: UsbTarget, current: UsbTarget) -> bool:
+        """Compare stable application identity without trusting transient address values."""
+
+        return (
+            expected.topology == current.topology
+            and expected.vendor_id == current.vendor_id
+            and expected.product_id == current.product_id
+            and expected.usb_serial == current.usb_serial
+        )
 
     def _state_matches_configuration(self, known: KnownDevice | None, device: Path | None = None) -> bool:
         """Require the exact configured path that originally verified recovery state."""
@@ -776,6 +850,7 @@ class Cul868Flasher:
     def _enter_bootloader(
         self,
         plan: _FlashPlan,
+        settings: Settings,
         report: ProgressReporter,
         begin_uncertain_transition: Callable[[], None],
     ) -> str:
@@ -786,7 +861,10 @@ class Cul868Flasher:
         for attempt in range(1, _VERSION_READ_ATTEMPTS + 1):
             bootloader_requested = False
             try:
-                with self._serial_factory(self._settings.device, self._settings.baudrate) as serial:
+                _application, device = self._configured_application_endpoint(
+                    settings, plan.application
+                )
+                with self._serial_factory(device, settings.baudrate) as serial:
                     before = serial.version()
                     report(20, "Requesting the verified CUL868 application to enter USB DFU mode.")
                     begin_uncertain_transition()
@@ -909,6 +987,7 @@ class Cul868Flasher:
         topology: str,
         expected_usb_serial: str | None,
         timeout: float,
+        baudrate: int,
         *,
         allow_qemu_topology_change: bool,
         allow_descriptor_serial_change: bool,
@@ -934,7 +1013,7 @@ class Cul868Flasher:
             if target is not None:
                 application, device = target
                 try:
-                    return application, device, self._read_version_once(device)
+                    return application, device, self._read_version_once(device, baudrate)
                 # A serial adapter can surface platform-specific regular
                 # errors; retry them while the CUL remains in its boot window.
                 except Exception as err:  # noqa: BLE001
@@ -1022,11 +1101,11 @@ class Cul868Flasher:
             )
         return last_error
 
-    def _read_version(self, device: Path) -> str:
+    def _read_version(self, device: Path, baudrate: int) -> str:
         last_error: Exception | None = None
         for attempt in range(1, _VERSION_READ_ATTEMPTS + 1):
             try:
-                return self._read_version_once(device)
+                return self._read_version_once(device, baudrate)
             # A fake or platform-specific serial adapter can surface diverse
             # transport errors; retry regular exceptions but never BaseException.
             except Exception as err:  # noqa: BLE001
@@ -1038,10 +1117,10 @@ class Cul868Flasher:
             f"CUL868 did not provide a valid V response after {_VERSION_READ_ATTEMPTS} attempts: {last_error}"
         ) from last_error
 
-    def _read_version_once(self, device: Path) -> str:
+    def _read_version_once(self, device: Path, baudrate: int) -> str:
         """Own one short serial session and return its validated version line."""
 
-        with self._serial_factory(device, self._settings.baudrate) as serial:
+        with self._serial_factory(device, baudrate) as serial:
             return serial.version()
 
     def _run_dfu(

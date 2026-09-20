@@ -14,10 +14,13 @@ explicit confirmation.
 | Older CUL bootloader | `03eb:2ffa` | Unsupported |
 
 The shared normal USB descriptor is not enough to identify a CUL firmware
-family. Before sending `B01`, the app opens the configured endpoint and checks
-the firmware's `V`/`VTS` response. It accepts only bounded ASCII Intel HEX
-input with valid checksums, one EOF record, non-overlapping application records,
-and a reset vector at `0x0000`. Writes at `0x7000` and above are rejected.
+family. Before sending `B01`, the app re-resolves the configured endpoint,
+binds it to the expected USB topology, opens the resulting direct
+`/dev/ttyACM*` or `/dev/ttyUSB*` node, and checks the firmware's `V`/`VTS`
+response. A changed topology or USB serial is refused. It accepts only bounded
+ASCII Intel HEX input with valid checksums, one EOF record, non-overlapping
+application records, and a reset vector at `0x0000`. Writes at `0x7000` and
+above are rejected.
 
 ## Configure
 
@@ -48,9 +51,10 @@ DFU mode. The value is still constrained to a safe `/dev/...` path.
 An upload is private to the app for at most 15 minutes, replaces a prior
 unclaimed validation, and is deleted after a flash attempt. Only one operation
 can be queued or running. Once shutdown is requested, later upload and flash
-handoffs are rejected before queued work is discarded. A request accepted
-immediately before that boundary is reported as discarded and is never flashed
-after shutdown begins.
+handoffs are rejected. A dequeued queued flash is atomically either claimed as
+the current non-interruptible operation before shutdown is observed, or
+discarded with its private upload. A claimed flash finishes; no additional
+queued flash starts after shutdown is observed.
 
 ## Recovery Safety
 
@@ -93,16 +97,29 @@ The app detects and coordinates matching, currently running:
   through its exact `serial_port` option.
 
 After a verified firmware change, CULFW-family descriptor changes can rename a
-`/dev/serial/by-id/...` alias. The app updates only one direct, unambiguous
-replacement alias on its own option and known paused consumers. It never rewrites
-`auto`, `cul`, a raw `/dev/ttyACM*` path, an unrelated path, or private
-configuration files.
+`/dev/serial/by-id/...` alias. The app reports one direct, unambiguous
+replacement alias when available and leaves every matching CUL consumer
+stopped. Update this app's **Device** option and each stopped consumer's path,
+then restart them manually. It never rewrites `auto`, `cul`, a raw
+`/dev/ttyACM*` path, an unrelated path, or private configuration files. The
+Supervisor options API has no atomic compare-and-set operation, so automatic
+rewrites could overwrite a simultaneous Configuration UI change.
 
 FHEM, Homegear, Node-RED, MaxCUL, remote services, and custom Core integrations
 can also own a CUL. Add the exact slug of a Home Assistant app to **Additional
 CUL consumer apps** to pause it, or stop unmanaged consumers manually. An
 explicitly listed app remains stopped after a descriptor alias migration so its
 private configuration can be reviewed safely.
+
+## LED Control
+
+The Ingress page shows explicit LED on/off buttons only for a recorded standard
+`V ... CUL868` response. Before each action the app takes exclusive serial
+ownership and verifies `V` again. CULFW/a-culfw documents lowercase `l01` for
+on and `l00` for off in the [CULFW command reference](https://github.com/heliflieger/a-culfw/blob/master/culfw/docs/commandref.html).
+The command has no readback, so the app reports that it sent the command rather
+than claiming a persistent LED state. TSCULFW (`VTS ...`) is intentionally not
+controlled because this app has no verified LED-command contract for it.
 
 ## Virtual Machines
 
@@ -123,7 +140,8 @@ mapping that removes the device from the guest.
 - The AppArmor child profile gives `dfu-programmer` raw USB access but no
   network permission. The Python process has no raw USB device-node access.
 - The app requests Home Assistant's `manager` role solely for precise consumer
-  option/lifecycle coordination. Install it only from a trusted repository.
+  discovery, hardware inventory, and lifecycle coordination. It never rewrites
+  other add-ons' option documents. Install it only from a trusted repository.
 
 The app's Python and web code is Apache-2.0. It builds and invokes the
 unmodified GPL-2.0 `dfu-programmer` v1.1.0 as a separate executable and ships

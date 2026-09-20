@@ -14,7 +14,7 @@ from app.state import (
     DeviceStateStore,
     KnownDevice,
 )
-from app.supervisor import CulConsumerPause, CulConsumerRetarget
+from app.supervisor import CulConsumerPause
 
 from .helpers import FakeSerialFactory, FakeSupervisor, FakeTopology, minimal_hex, target
 
@@ -73,6 +73,74 @@ class FlasherTests(unittest.TestCase):
                 ],
             )
             self.assertTrue(serial_factory.sessions[0].entered_bootloader)
+        finally:
+            path.unlink(missing_ok=True)
+
+    def test_b01_uses_a_freshly_verified_concrete_tty_not_the_by_id_alias(self) -> None:
+        path, image = self._staged_image()
+        previous = Path("/dev/serial/by-id/usb-busware.de_CUL868-old-if00")
+        try:
+            class StableAliasTopology(FakeTopology):
+                def by_id_paths_for_tty(self, _device: Path) -> tuple[Path, ...]:
+                    return (previous,)
+
+            topology = StableAliasTopology()
+            serial_factory = FakeSerialFactory(topology, ["V old CUL868", "V new CUL868"])
+
+            def runner(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[object]:
+                if command[-1] == "start":
+                    topology.mode = "application"
+                return subprocess.CompletedProcess(command, 0)
+
+            with tempfile.TemporaryDirectory() as state_directory:
+                flasher = Cul868Flasher(
+                    self._settings(device=previous),
+                    topology=topology,
+                    state_store=DeviceStateStore(Path(state_directory)),
+                    supervisor=FakeSupervisor(),  # type: ignore[arg-type]
+                    serial_factory=serial_factory,  # type: ignore[arg-type]
+                    dfu_executable="/bin/true",
+                    runner=runner,
+                )
+                flasher.flash(image, lambda _percent, _message: None)
+
+            self.assertTrue(serial_factory.calls)
+            self.assertTrue(
+                all(device == Path("/dev/ttyACM0") for device, _baudrate in serial_factory.calls)
+            )
+        finally:
+            path.unlink(missing_ok=True)
+
+    def test_flash_refuses_a_rebound_configured_alias_before_b01(self) -> None:
+        path, image = self._staged_image()
+        previous = Path("/dev/serial/by-id/usb-busware.de_CUL868-old-if00")
+        try:
+            class ReboundAliasTopology(FakeTopology):
+                def __init__(self) -> None:
+                    super().__init__()
+                    self.configured_calls = 0
+
+                def configured_application(self, _device: Path):  # type: ignore[override]
+                    self.configured_calls += 1
+                    if self.configured_calls == 1:
+                        return self.application
+                    return target(topology="2-4", serial="OTHER-CUL")
+
+            topology = ReboundAliasTopology()
+            supervisor = FakeSupervisor()
+            serial_factory = FakeSerialFactory(topology, ["V old CUL868"])
+            flasher = Cul868Flasher(
+                self._settings(device=previous),
+                topology=topology,
+                supervisor=supervisor,  # type: ignore[arg-type]
+                serial_factory=serial_factory,  # type: ignore[arg-type]
+            )
+
+            with self.assertRaisesRegex(FlashError, "target changed after validation"):
+                flasher.flash(image, lambda _percent, _message: None)
+
+            self.assertEqual(serial_factory.calls, [])
+            self.assertEqual(supervisor.events, ["stop", "start"])
         finally:
             path.unlink(missing_ok=True)
 
@@ -445,6 +513,62 @@ class FlasherTests(unittest.TestCase):
         self.assertEqual(known.version, "V 1.2 CUL868")
         self.assertEqual(known.configured_device, "/dev/ttyACM0")
 
+    def test_set_led_verifies_culfw_and_restores_consumers(self) -> None:
+        topology = FakeTopology()
+        supervisor = FakeSupervisor()
+        serial_factory = FakeSerialFactory(topology, ["V 1.67 CUL868"])
+        with tempfile.TemporaryDirectory() as state_directory:
+            state = DeviceStateStore(Path(state_directory))
+            flasher = Cul868Flasher(
+                self._settings(),
+                topology=topology,
+                state_store=state,
+                supervisor=supervisor,  # type: ignore[arg-type]
+                serial_factory=serial_factory,  # type: ignore[arg-type]
+            )
+            result = flasher.set_led(True)
+            known = state.load()
+
+        self.assertEqual(result["enabled"], True)
+        self.assertEqual(result["version"], "V 1.67 CUL868")
+        self.assertEqual(serial_factory.sessions[0].led_states, [True])
+        self.assertEqual(serial_factory.calls, [(Path("/dev/ttyACM0"), 9600)])
+        self.assertEqual(supervisor.events, ["stop", "start"])
+        self.assertIsNotNone(known)
+        assert known is not None
+        self.assertEqual(known.version, "V 1.67 CUL868")
+
+    def test_set_led_refuses_tsculfw_without_sending_an_led_command(self) -> None:
+        topology = FakeTopology()
+        supervisor = FakeSupervisor()
+        serial_factory = FakeSerialFactory(topology, ["VTS 0.43 CUL868"])
+        flasher = Cul868Flasher(
+            self._settings(),
+            topology=topology,
+            supervisor=supervisor,  # type: ignore[arg-type]
+            serial_factory=serial_factory,  # type: ignore[arg-type]
+        )
+
+        with self.assertRaisesRegex(FlashError, "detected TSCULFW"):
+            flasher.set_led(False)
+
+        self.assertEqual(serial_factory.sessions[0].led_states, [])
+        self.assertEqual(supervisor.events, ["stop", "start"])
+
+    def test_set_led_does_not_pause_consumers_when_application_is_unavailable(self) -> None:
+        topology = FakeTopology(mode="bootloader")
+        supervisor = FakeSupervisor()
+        flasher = Cul868Flasher(
+            self._settings(),
+            topology=topology,
+            supervisor=supervisor,  # type: ignore[arg-type]
+        )
+
+        with self.assertRaisesRegex(FlashError, "configured CUL application is unavailable"):
+            flasher.set_led(True)
+
+        self.assertEqual(supervisor.events, [])
+
     def test_startup_verification_does_not_pause_wmbusmeters_in_dfu_mode(self) -> None:
         topology = FakeTopology(mode="bootloader")
         supervisor = FakeSupervisor()
@@ -787,7 +911,7 @@ class FlasherTests(unittest.TestCase):
         finally:
             path.unlink(missing_ok=True)
 
-    def test_flash_migrates_by_id_path_across_culfw_families(self) -> None:
+    def test_flash_reports_by_id_path_change_and_keeps_consumers_stopped(self) -> None:
         cases = (
             (
                 Path("/dev/serial/by-id/usb-busware.de_CUL868-culfw-if00"),
@@ -816,24 +940,8 @@ class FlasherTests(unittest.TestCase):
                                 raise AssertionError(f"unexpected CUL endpoint: {device}")
                             return (expected_current,)
 
-                    class RetargetingSupervisor(FakeSupervisor):
-                        def __init__(self) -> None:
-                            super().__init__()
-                            self.wmbus_retargets: list[tuple[Path, Path]] = []
-                            self.own_retargets: list[tuple[Path, Path]] = []
-
-                        def retarget_paused_cul_consumers(
-                            self, _pause: object, old: Path, new: Path
-                        ) -> CulConsumerRetarget:
-                            self.wmbus_retargets.append((old, new))
-                            return CulConsumerRetarget(wmbusmeters_addons=("wmbusmeters",))
-
-                        def retarget_own_device_path(self, old: Path, new: Path) -> bool:
-                            self.own_retargets.append((old, new))
-                            return True
-
                     topology = DescriptorChangingTopology()
-                    supervisor = RetargetingSupervisor()
+                    supervisor = FakeSupervisor()
                     serial_factory = FakeSerialFactory(topology, [before, after])
 
                     def runner(
@@ -861,19 +969,26 @@ class FlasherTests(unittest.TestCase):
                         result = flasher.flash(image, lambda _percent, _message: None)
                         known = state.load()
 
-                    self.assertEqual(result["device"], str(current))
-                    self.assertEqual(result["retargeted_wmbusmeters_addons"], ["wmbusmeters"])
-                    self.assertEqual(supervisor.wmbus_retargets, [(previous, current)])
-                    self.assertEqual(supervisor.own_retargets, [(previous, current)])
-                    self.assertEqual(supervisor.events, ["stop", "start"])
+                    self.assertEqual(result["device"], str(previous))
+                    self.assertEqual(
+                        result["manual_serial_path_migration"],
+                        {
+                            "previous": str(previous),
+                            "current": str(current),
+                            "application_endpoint": "/dev/ttyACM0",
+                            "reason": None,
+                        },
+                    )
+                    self.assertEqual(result["stopped_cul_addons"], ["wmbusmeters"])
+                    self.assertEqual(supervisor.events, ["stop"])
                     self.assertIsNotNone(known)
                     assert known is not None
                     self.assertEqual(known.usb_serial, usb_serial)
-                    self.assertEqual(known.configured_device, str(current))
+                    self.assertEqual(known.configured_device, str(previous))
                 finally:
                     path.unlink(missing_ok=True)
 
-    def test_flash_migrates_by_id_path_from_supervisor_hardware_inventory(self) -> None:
+    def test_flash_reports_by_id_path_from_supervisor_hardware_inventory(self) -> None:
         path, image = self._staged_image()
         previous = Path("/dev/serial/by-id/usb-busware.de_CUL868-old-if00")
         current = Path("/dev/serial/by-id/usb-Atmel_CUL868-new-if00")
@@ -887,23 +1002,11 @@ class FlasherTests(unittest.TestCase):
             class HardwareInventorySupervisor(FakeSupervisor):
                 def __init__(self) -> None:
                     super().__init__()
-                    self.wmbus_retargets: list[tuple[Path, Path]] = []
-                    self.own_retargets: list[tuple[Path, Path]] = []
                     self.hardware_queries: list[Path] = []
 
                 def hardware_serial_by_id_paths_for_tty(self, device: Path) -> tuple[Path, ...]:
                     self.hardware_queries.append(device)
                     return (current,)
-
-                def retarget_paused_cul_consumers(
-                    self, _pause: object, old: Path, new: Path
-                ) -> CulConsumerRetarget:
-                    self.wmbus_retargets.append((old, new))
-                    return CulConsumerRetarget(wmbusmeters_addons=("wmbusmeters",))
-
-                def retarget_own_device_path(self, old: Path, new: Path) -> bool:
-                    self.own_retargets.append((old, new))
-                    return True
 
             topology = MissingLocalAliasTopology()
             supervisor = HardwareInventorySupervisor()
@@ -927,11 +1030,11 @@ class FlasherTests(unittest.TestCase):
                 )
                 result = flasher.flash(image, lambda _percent, _message: None)
 
-            self.assertEqual(result["device"], str(current))
+            self.assertEqual(result["device"], str(previous))
+            self.assertEqual(result["manual_serial_path_migration"]["current"], str(current))
             self.assertEqual(supervisor.hardware_queries, [Path("/dev/ttyACM0")])
-            self.assertEqual(supervisor.wmbus_retargets, [(previous, current)])
-            self.assertEqual(supervisor.own_retargets, [(previous, current)])
-            self.assertEqual(supervisor.events, ["stop", "start"])
+            self.assertEqual(result["stopped_cul_addons"], ["wmbusmeters"])
+            self.assertEqual(supervisor.events, ["stop"])
         finally:
             path.unlink(missing_ok=True)
 
@@ -975,7 +1078,7 @@ class FlasherTests(unittest.TestCase):
             [(93, "Waiting for the new CUL serial-by-id alias to become available.")],
         )
 
-    def test_flash_refuses_ambiguous_changed_by_id_paths_and_leaves_readers_stopped(self) -> None:
+    def test_flash_reports_ambiguous_changed_by_id_paths_and_leaves_readers_stopped(self) -> None:
         path, image = self._staged_image()
         previous = Path("/dev/serial/by-id/usb-busware.de_CUL868-old-if00")
         try:
@@ -1007,11 +1110,16 @@ class FlasherTests(unittest.TestCase):
                     dfu_executable="/bin/true",
                     runner=runner,
                 )
-                with self.assertRaisesRegex(FlashError, "multiple /dev/serial/by-id aliases"):
-                    flasher.flash(image, lambda _percent, _message: None)
+                result = flasher.flash(image, lambda _percent, _message: None)
                 known = state.load()
 
             self.assertEqual(supervisor.events, ["stop"])
+            self.assertIsNone(result["manual_serial_path_migration"]["current"])
+            self.assertIn(
+                "multiple /dev/serial/by-id aliases",
+                result["manual_serial_path_migration"]["reason"],
+            )
+            self.assertEqual(result["stopped_cul_addons"], ["wmbusmeters"])
             self.assertIsNotNone(known)
             assert known is not None
             self.assertEqual(known.version, "VTS 0.43 CUL868")
@@ -1019,7 +1127,7 @@ class FlasherTests(unittest.TestCase):
         finally:
             path.unlink(missing_ok=True)
 
-    def test_serial_by_id_migration_failure_keeps_cul_consumers_paused(self) -> None:
+    def test_serial_by_id_change_keeps_every_paused_consumer_stopped(self) -> None:
         previous = Path("/dev/serial/by-id/usb-busware.de_CUL868-old-if00")
         current = Path("/dev/serial/by-id/usb-busware.de_CUL868-new-if00")
 
@@ -1027,61 +1135,31 @@ class FlasherTests(unittest.TestCase):
             def by_id_paths_for_tty(self, _device: Path) -> tuple[Path, ...]:
                 return (current,)
 
-        class FailingSupervisor(FakeSupervisor):
-            def retarget_paused_cul_consumers(
-                self, _pause: object, _old: Path, _new: Path
-            ) -> CulConsumerRetarget:
-                raise RuntimeError("simulated Supervisor transport failure")
-
-        supervisor = FailingSupervisor()
         flasher = Cul868Flasher(
             self._settings(device=previous),
             topology=OneAliasTopology(),
-            supervisor=supervisor,  # type: ignore[arg-type]
+            supervisor=FakeSupervisor(),  # type: ignore[arg-type]
         )
-        pause = CulConsumerPause(wmbusmeters_addons=("wmbusmeters",))
-
-        with self.assertRaisesRegex(FlashError, "serial-by-id path could not be migrated"):
-            flasher._migrate_serial_by_id_path(
-                previous,
-                Path("/dev/ttyACM0"),
-                pause,
-                lambda _percent, _message: None,
-            )
-
-        self.assertFalse(pause.restore_after_error)
-
-    def test_serial_by_id_migration_retains_opted_in_external_apps(self) -> None:
-        previous = Path("/dev/serial/by-id/usb-busware.de_CUL868-old-if00")
-        current = Path("/dev/serial/by-id/usb-busware.de_CUL868-new-if00")
-
-        class OneAliasTopology(FakeTopology):
-            def by_id_paths_for_tty(self, _device: Path) -> tuple[Path, ...]:
-                return (current,)
-
-        class RetargetingSupervisor(FakeSupervisor):
-            def retarget_own_device_path(self, _old: Path, _new: Path) -> bool:
-                return True
-
-        flasher = Cul868Flasher(
-            self._settings(device=previous),
-            topology=OneAliasTopology(),
-            supervisor=RetargetingSupervisor(),  # type: ignore[arg-type]
+        pause = CulConsumerPause(
+            wmbusmeters_addons=("wmbusmeters",),
+            max2mqtt_addons=("max2mqtt",),
+            additional_addons=("local_homegear",),
         )
-        pause = CulConsumerPause(additional_addons=("local_homegear",))
         reports: list[str] = []
 
-        device, retargeted = flasher._migrate_serial_by_id_path(
+        migration = flasher._manual_serial_by_id_migration(
             previous,
             Path("/dev/ttyACM0"),
             pause,
             lambda _percent, message: reports.append(message),
         )
 
-        self.assertEqual(device, current)
-        self.assertEqual(retargeted.addons, ())
-        self.assertEqual(pause.retained_addons, ("local_homegear",))
-        self.assertTrue(any("additional CUL apps remain stopped" in message for message in reports))
+        self.assertEqual(migration["current"], str(current))
+        self.assertEqual(
+            pause.retained_addons,
+            ("local_homegear", "max2mqtt", "wmbusmeters"),
+        )
+        self.assertTrue(any("update CUL app paths manually" in message for message in reports))
 
     def test_qemu_workaround_waits_after_each_identity_transition(self) -> None:
         path, image = self._staged_image()

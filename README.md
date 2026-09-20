@@ -24,7 +24,11 @@ DFU, and validates the uploaded Intel HEX file before it can be queued.
 
 The normal `03eb:204b` descriptor is shared by the CUL firmware families
 above. The serial `V` response is therefore the final identity check before
-the add-on sends `B01` to reboot into DFU.
+the add-on sends `B01` to reboot into DFU. Immediately before `B01`, it
+re-resolves the configured path, binds it to the expected USB topology, and
+opens the resulting direct `/dev/ttyACM*` or `/dev/ttyUSB*` endpoint rather
+than reopening a mutable `/dev/serial/by-id/...` symlink. A changed topology or
+USB serial before `B01` is refused.
 
 [Smarthome Agentur CULFW1](https://github.com/smarthomeagentur/culfw1) is a
 historical CULFW source clone and uses the regular `V ... CUL868` convention.
@@ -111,19 +115,17 @@ resolve to that exact new CDC endpoint. If the add-on's local udev view has
 not caught up, it also reads the canonical `by_id` value for that exact
 `dev_path` from the Supervisor [hardware inventory API](https://developers.home-assistant.io/docs/api/supervisor/endpoints/#get-hardwareinfo).
 If the configured path is a direct `/dev/serial/by-id/...` alias, its old
-alias disappeared, and exactly one new alias exists, the add-on updates its
-own option and the exact direct path in any supported CUL consumers it paused
-for this flash. The running process also uses the new path for a later
-operation without requiring a restart.
+alias disappeared, and exactly one new alias exists, the completion message
+shows that alias and leaves every matching CUL consumer stopped. Update this
+add-on's **Device** option and each stopped consumer's CUL path, then restart
+them manually. If no unique replacement is available, the message instead
+shows the verified direct CDC endpoint to help resolve the path safely.
 
-The migration deliberately refuses to guess when no alias or more than one
-alias resolves to the verified endpoint, or when the add-on option no longer
-contains the expected old path when it is checked. In that case the firmware is
-still verified, but its configuration migration needs attention and matching
-CUL consumers remain stopped until the path is resolved manually. `auto`,
-`cul`, raw `/dev/ttyACM*`, and unrelated configurations are never rewritten.
-Avoid editing any consumer's device option during a flash: the Supervisor
-options API does not provide an atomic compare-and-set update.
+The add-on deliberately never posts a replacement Supervisor option document.
+The API has no atomic compare-and-set update, so automatic rewrites could
+overwrite a simultaneous Configuration UI change or unrelated credentials.
+`auto`, `cul`, raw `/dev/ttyACM*`, and unrelated configurations are never
+rewritten. A changed alias always needs an explicit operator review.
 
 ## CUL consumer coordination
 
@@ -136,10 +138,11 @@ CUL consumers from their documented Supervisor option schemas:
 - [MAX! to MQTT Bridge (`max2mqtt`)](https://github.com/pwurbs/max2mqtt): the
   exact `serial_port` setting for the selected CUL.
 
-It pauses and restores only matching, currently running instances. Following a
-verified, unambiguous serial-by-id migration, it updates only their exact old
-path values. The implementation neither logs nor stores the options, which may
-contain MQTT credentials.
+It pauses and restores only matching, currently running instances. If a
+verified flash changes a serial-by-id alias, it retains every matching consumer
+in the stopped state until its configuration has been reviewed manually. The
+implementation never writes consumer option documents and neither logs nor
+stores their options, which may contain MQTT credentials.
 
 FHEM and Homegear can also own a CUL, but the normal [Home Assistant Homematic
 integration](https://www.home-assistant.io/integrations/homematic/) talks to
@@ -167,6 +170,18 @@ reader from reopening a radio with unknown firmware. They are restored
 automatically only after the CUL application has returned and answered `V`;
 after a failed update, repair the radio first and then start the affected apps
 manually.
+
+## LED control
+
+The Ingress page can send an explicit **Turn LED on** or **Turn LED off** command
+only after the add-on recorded a standard `V ... CUL868` response. It reads `V`
+again while it exclusively owns the serial endpoint before sending the command.
+CULFW and a-culfw document lowercase `l01` for on and `l00` for off in the
+[CULFW command reference](https://github.com/heliflieger/a-culfw/blob/master/culfw/docs/commandref.html).
+The command has no readback, so the UI reports that it was sent rather than
+claiming to observe a persistent LED state. TSCULFW identifies itself with
+`VTS ...` and is deliberately not controlled because this project has no
+verified LED-command contract for it.
 
 ## Virtual machines and USB re-enumeration
 
@@ -209,9 +224,10 @@ personalities must still be visible to Home Assistant.
 - Uploads are size-bounded, stored with mode `0600` on add-on tmpfs, expire
   after 15 minutes, and are deleted after an attempted flash. A newer
   unflashed validation replaces the previous one. Once shutdown is requested,
-  later upload and flash handoffs are rejected before queued work is discarded.
-  A request accepted immediately before that boundary is reported as discarded,
-  never flashed after shutdown begins.
+  later upload and flash handoffs are rejected. A dequeued queued flash is
+  atomically either claimed as the current non-interruptible operation before
+  shutdown is observed, or discarded with its private upload. A claimed flash
+  finishes; no additional queued flash starts after shutdown is observed.
 - Only one flash can run or queue at a time. A process lock is a second guard
   around serial and raw USB access.
 - `dfu-programmer` receives an exact `atmega32u4:<bus>,<address>` selector
@@ -224,10 +240,10 @@ personalities must still be visible to Home Assistant.
   network permission. The Python process has no raw USB device-node access.
 
 The add-on requests Home Assistant's `manager` role only because the Supervisor
-requires it to read/update exact known consumer device options and to stop/start
-matching CUL consumer apps around a flash. The role grants broader Supervisor
-authority than this implementation uses, so install it only from a trusted
-repository.
+requires it to read known consumer device options and hardware inventory, and
+to stop/start matching CUL consumer apps around a flash. It does not update
+other add-ons' option documents. The role grants broader Supervisor authority
+than this implementation uses, so install it only from a trusted repository.
 The relevant option and lifecycle endpoints are documented in the [Home
 Assistant Supervisor API](https://developers.home-assistant.io/docs/api/supervisor/endpoints/).
 

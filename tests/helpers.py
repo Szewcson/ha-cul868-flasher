@@ -7,7 +7,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Self
 
-from app.supervisor import CulConsumerPause, CulConsumerRetarget
+from app.supervisor import CulConsumerPause
 from app.usb import (
     APPLICATION_PRODUCT_ID,
     APPLICATION_VENDOR_ID,
@@ -93,6 +93,7 @@ class FakeSerial:
         self._topology = topology
         self._versions = versions
         self.entered_bootloader = False
+        self.led_states: list[bool] = []
         self._open = False
 
     def __enter__(self) -> Self:
@@ -113,6 +114,11 @@ class FakeSerial:
             raise AssertionError("B01 must be sent while the serial session is open")
         self.entered_bootloader = True
         self._topology.mode = "bootloader"
+
+    def set_led(self, enabled: bool) -> None:
+        if not self._open:
+            raise AssertionError("LED command must be sent while the serial session is open")
+        self.led_states.append(enabled)
 
 
 class FakeSerialFactory:
@@ -149,11 +155,6 @@ class FakeSupervisor:
         else:
             if pause.addons_to_restore:
                 self.events.append("start")
-
-    def retarget_paused_cul_consumers(
-        self, _pause: CulConsumerPause, _old: Path, _new: Path
-    ) -> CulConsumerRetarget:
-        return CulConsumerRetarget()
 
     def hardware_serial_by_id_paths_for_tty(self, _device: Path) -> tuple[Path, ...]:
         """The default fake has no Supervisor-only alias information."""

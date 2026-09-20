@@ -19,12 +19,21 @@ from .helpers import minimal_hex
 class _IngressFlasher:
     def __init__(self, preflight: FlashPreflight | None = None) -> None:
         self._preflight = preflight or FlashPreflight("application", "2-3", "Ready to verify")
+        self.led_states: list[bool] = []
 
     def status(self) -> dict[str, object]:
         return {"state": "application", "topology": "2-3", "message": "Ready"}
 
     def preflight(self) -> FlashPreflight:
         return self._preflight
+
+    def set_led(self, enabled: bool) -> dict[str, object]:
+        self.led_states.append(enabled)
+        return {
+            "enabled": enabled,
+            "version": "V 1.67 CUL868",
+            "message": f"CULFW LED {'on' if enabled else 'off'} command was sent.",
+        }
 
 
 class IngressApiTests(unittest.TestCase):
@@ -83,6 +92,26 @@ class IngressApiTests(unittest.TestCase):
             queued = api.flash(second["artifact_id"], True, None)
             operation = controller.get(timeout=0)
             self.assertEqual(queued["operation_id"], operation.operation_id if operation else None)
+            assert operation is not None
+            api.discard_image(operation.image)
+
+    def test_led_control_requires_a_boolean_and_an_idle_flash_queue(self) -> None:
+        controller = OperationController()
+        flasher = _IngressFlasher()
+        with tempfile.TemporaryDirectory() as directory:
+            api = IngressApi(controller, flasher, Path(directory))  # type: ignore[arg-type]
+
+            response = api.set_led(True)
+            self.assertEqual(response["enabled"], True)
+            self.assertEqual(flasher.led_states, [True])
+            with self.assertRaisesRegex(IngressError, "must be a boolean"):
+                api.set_led("true")
+
+            staged = api.validate_upload(io.BytesIO(minimal_hex()), len(minimal_hex()))
+            api.flash(staged["artifact_id"], True, None)
+            with self.assertRaises(OperationBusyError):
+                api.set_led(False)
+            operation = controller.get(timeout=0)
             assert operation is not None
             api.discard_image(operation.image)
 
@@ -246,5 +275,21 @@ class IngressServerTests(unittest.TestCase):
             payload = json.loads(response.read())
             self.assertEqual(response.status, 403)
             self.assertIn("Ingress request header", payload["error"])
+
+            connection = http.client.HTTPConnection("127.0.0.1", server.port, timeout=5)
+            body = json.dumps({"enabled": False}).encode()
+            connection.request(
+                "POST",
+                "/api/led",
+                body,
+                {
+                    "Content-Type": "application/json",
+                    "X-Requested-With": "XMLHttpRequest",
+                },
+            )
+            response = connection.getresponse()
+            payload = json.loads(response.read())
+            self.assertEqual(response.status, 200)
+            self.assertEqual(payload["enabled"], False)
         finally:
             server.stop()

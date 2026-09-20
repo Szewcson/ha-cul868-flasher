@@ -212,6 +212,21 @@ class IngressApi:
             self._artifacts.consume(artifact_id)
         return {"operation_id": operation.operation_id, "state": "queued"}
 
+    def set_led(self, enabled: object) -> dict[str, object]:
+        """Send one guarded CULFW LED command when no flash is pending.
+
+        Keep admission locked while the flasher acquires its serial lock. This
+        prevents a flash from being queued between the idle check and the LED
+        command, while the flasher remains the single owner of USB access.
+        """
+
+        if not isinstance(enabled, bool):
+            raise IngressError("LED state must be a boolean")
+        with self._submission_lock:
+            self._require_accepting_mutations_locked()
+            self._require_idle()
+            return self._flasher.set_led(enabled)
+
     @staticmethod
     def discard_image(image: HexImage) -> None:
         image.path.unlink(missing_ok=True)
@@ -356,6 +371,9 @@ class IngressServer:
                             body.get("confirm"),
                             body.get("confirm_unpaired_recovery"),
                         )
+                    elif path == "/api/led":
+                        body = self._json_body()
+                        response = api.set_led(body.get("enabled"))
                     else:
                         self._json_error(HTTPStatus.NOT_FOUND, "resource was not found")
                         return

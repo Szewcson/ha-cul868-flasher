@@ -113,13 +113,14 @@ private configuration can be reviewed safely.
 
 ## LED Control
 
-The Ingress page shows explicit LED on/off buttons only for a recorded standard
-`V ... CUL868` response. Before each action the app takes exclusive serial
-ownership and verifies `V` again. CULFW/a-culfw documents lowercase `l01` for
-on and `l00` for off in the [CULFW command reference](https://github.com/heliflieger/a-culfw/blob/master/culfw/docs/commandref.html).
-The command has no readback, so the app reports that it sent the command rather
-than claiming a persistent LED state. TSCULFW (`VTS ...`) is intentionally not
-controlled because this app has no verified LED-command contract for it.
+The Ingress page shows explicit LED on/off buttons only for a recorded
+`V ... CUL868` or `VTS ... CUL868` response. Before each action the app takes
+exclusive serial ownership and verifies `V` again. CULFW/a-culfw documents
+lowercase `l01` for on and `l00` for off in the [CULFW command reference](https://github.com/heliflieger/a-culfw/blob/master/culfw/docs/commandref.html).
+TSCULFW retains that command: its source registers `l` for the LED handler,
+which reads the following hexadecimal byte as the LED mode. The command has no
+readback, so the app reports that it sent the command rather than claiming a
+persistent LED state.
 
 ## Virtual Machines
 

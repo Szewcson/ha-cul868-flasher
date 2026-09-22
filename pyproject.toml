@@ -1,6 +1,6 @@
 [project]
 name = "ha-cul868-flasher"
-version = "0.1.14"
+version = "0.1.15"
 requires-python = ">=3.11"
 
 [tool.ruff]

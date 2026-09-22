@@ -27,16 +27,17 @@ _READ_LIMIT = 2 * 1024
 _VERSION_PREFIXES = (b"V ", b"VTS ")
 
 
-def supports_culfw_led_control(version: str) -> bool:
-    """Return whether a verified version has CULFW's documented LED command.
+def supports_cul_led_control(version: str) -> bool:
+    """Return whether a verified CUL868 version has the CUL LED command.
 
-    The CULFW/a-culfw protocol uses ``V ... CUL868`` and documents ``l00``
-    and ``l01`` for LED control. TSCULFW identifies itself with ``VTS ...``;
-    it is deliberately excluded because this add-on has no verified command
-    contract for its LED implementation.
+    CULFW/a-culfw use ``V ... CUL868`` and document ``l00`` and ``l01`` for
+    LED control. TSCULFW uses ``VTS ... CUL868`` but retains the same command:
+    its source registers ``l`` for ``led_func()``, which reads the following
+    byte as the persisted LED mode. Restrict this to the two known version
+    prefixes so an arbitrary CUL868-compatible firmware is not controlled.
     """
 
-    return version.startswith("V ") and "CUL868" in version
+    return version.startswith(("V ", "VTS ")) and "CUL868" in version
 
 
 class CulSerial:
@@ -124,7 +125,7 @@ class CulSerial:
                 raise CulSerialError(f"CUL bootloader command could not drain: {err}") from err
 
     def set_led(self, enabled: bool) -> None:
-        """Send CULFW's documented LED command after the caller verified ``V``.
+        """Send the CULFW/TSCULFW LED command after the caller verified ``V``.
 
         CULFW does not echo commands, so draining the serial buffer only proves
         that the command reached the kernel; it is not a readback of LED state.

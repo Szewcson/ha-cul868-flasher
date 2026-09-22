@@ -213,7 +213,7 @@ class IngressApi:
         return {"operation_id": operation.operation_id, "state": "queued"}
 
     def set_led(self, enabled: object) -> dict[str, object]:
-        """Send one guarded CULFW LED command when no flash is pending.
+        """Send one guarded CUL LED command when no flash is pending.
 
         Keep admission locked while the flasher acquires its serial lock. This
         prevents a flash from being queued between the idle check and the LED

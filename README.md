@@ -174,14 +174,14 @@ manually.
 ## LED control
 
 The Ingress page can send an explicit **Turn LED on** or **Turn LED off** command
-only after the add-on recorded a standard `V ... CUL868` response. It reads `V`
+only after the add-on recorded `V ... CUL868` or `VTS ... CUL868`. It reads `V`
 again while it exclusively owns the serial endpoint before sending the command.
 CULFW and a-culfw document lowercase `l01` for on and `l00` for off in the
 [CULFW command reference](https://github.com/heliflieger/a-culfw/blob/master/culfw/docs/commandref.html).
-The command has no readback, so the UI reports that it was sent rather than
-claiming to observe a persistent LED state. TSCULFW identifies itself with
-`VTS ...` and is deliberately not controlled because this project has no
-verified LED-command contract for it.
+TSCULFW retains that command: its source registers `l` for the LED handler,
+which reads the following hexadecimal byte as the LED mode. The command has no
+readback, so the UI reports that it was sent rather than claiming to observe a
+persistent LED state.
 
 ## Virtual machines and USB re-enumeration
 

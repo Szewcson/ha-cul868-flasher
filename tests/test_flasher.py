@@ -538,21 +538,23 @@ class FlasherTests(unittest.TestCase):
         assert known is not None
         self.assertEqual(known.version, "V 1.67 CUL868")
 
-    def test_set_led_refuses_tsculfw_without_sending_an_led_command(self) -> None:
+    def test_set_led_supports_tsculfw_and_restores_consumers(self) -> None:
         topology = FakeTopology()
         supervisor = FakeSupervisor()
         serial_factory = FakeSerialFactory(topology, ["VTS 0.43 CUL868"])
-        flasher = Cul868Flasher(
-            self._settings(),
-            topology=topology,
-            supervisor=supervisor,  # type: ignore[arg-type]
-            serial_factory=serial_factory,  # type: ignore[arg-type]
-        )
+        with tempfile.TemporaryDirectory() as state_directory:
+            flasher = Cul868Flasher(
+                self._settings(),
+                topology=topology,
+                state_store=DeviceStateStore(Path(state_directory)),
+                supervisor=supervisor,  # type: ignore[arg-type]
+                serial_factory=serial_factory,  # type: ignore[arg-type]
+            )
+            result = flasher.set_led(False)
 
-        with self.assertRaisesRegex(FlashError, "detected TSCULFW"):
-            flasher.set_led(False)
-
-        self.assertEqual(serial_factory.sessions[0].led_states, [])
+        self.assertEqual(result["enabled"], False)
+        self.assertEqual(result["version"], "VTS 0.43 CUL868")
+        self.assertEqual(serial_factory.sessions[0].led_states, [False])
         self.assertEqual(supervisor.events, ["stop", "start"])
 
     def test_set_led_does_not_pause_consumers_when_application_is_unavailable(self) -> None:

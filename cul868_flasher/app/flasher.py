@@ -17,7 +17,7 @@ from typing import Protocol, Self
 
 from .hexfile import HexImage, parse_hex_file
 from .models import Settings
-from .serial import CulSerial, supports_culfw_led_control
+from .serial import CulSerial, supports_cul_led_control
 from .state import (
     RECOVERY_BINDING_HANDOFF_PENDING,
     RECOVERY_BINDING_OBSERVED_BOOTLOADER,
@@ -249,7 +249,7 @@ class Cul868Flasher:
             return version
 
     def set_led(self, enabled: bool) -> dict[str, object]:
-        """Send a guarded CULFW LED command to the configured application.
+        """Send a guarded CULFW/TSCULFW LED command to the configured application.
 
         The command is intentionally serialized with flashing and takes the
         same exclusive serial ownership path. A final ``V`` response proves a
@@ -271,13 +271,9 @@ class Cul868Flasher:
                     application, device = self._configured_application_endpoint(settings)
                     with self._serial_factory(device, settings.baudrate) as serial:
                         version = serial.version()
-                        if not supports_culfw_led_control(version):
-                            if version.startswith("VTS "):
-                                raise FlashError(
-                                    "detected TSCULFW does not expose the documented CULFW LED command"
-                                )
+                        if not supports_cul_led_control(version):
                             raise FlashError(
-                                "detected CUL firmware does not expose the documented CULFW LED command"
+                                "detected CUL firmware does not expose the supported LED command"
                             )
                         serial.set_led(enabled)
                     self._state.save(
@@ -292,12 +288,12 @@ class Cul868Flasher:
             except FlashError:
                 raise
             except Exception as err:
-                raise FlashError(f"could not set the CULFW LED: {err}") from err
+                raise FlashError(f"could not set the CUL LED: {err}") from err
             state = "on" if enabled else "off"
             return {
                 "enabled": enabled,
                 "version": version,
-                "message": f"CULFW LED {state} command was sent after V verification.",
+                "message": f"CUL LED {state} command was sent after V verification.",
             }
 
     def flash(

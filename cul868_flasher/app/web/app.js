@@ -44,7 +44,7 @@ function updateFlashButton() {
 
 function supportsLedControl(device) {
   const version = device.last_verified_version;
-  return device.state === "application" && typeof version === "string" && version.startsWith("V ") && version.includes("CUL868");
+  return device.state === "application" && typeof version === "string" && (version.startsWith("V ") || version.startsWith("VTS ")) && version.includes("CUL868");
 }
 
 function updateLedControls(device, operation) {
@@ -165,14 +165,14 @@ async function setLed(enabled) {
   ledOnButton.disabled = true;
   ledOffButton.disabled = true;
   ledResult.hidden = false;
-  ledResult.textContent = `Sending CULFW LED ${enabled ? "on" : "off"} command...`;
+  ledResult.textContent = `Sending CUL LED ${enabled ? "on" : "off"} command...`;
   try {
     const payload = await request("api/led", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ enabled }),
     });
-    ledResult.textContent = payload.message || `CULFW LED ${enabled ? "on" : "off"} command sent.`;
+    ledResult.textContent = payload.message || `CUL LED ${enabled ? "on" : "off"} command sent.`;
   } catch (error) {
     ledResult.textContent = error.message;
   } finally {

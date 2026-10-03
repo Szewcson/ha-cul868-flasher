@@ -60,7 +60,11 @@ class SerialSession(Protocol):
 
     def enter_bootloader(self) -> None: ...
 
-    def set_led(self, enabled: bool) -> None: ...
+    def set_led(self, mode: str) -> None: ...
+
+    def uptime_ticks(self) -> int: ...
+
+    def mbus_mode(self) -> str: ...
 
 
 SerialFactory = Callable[[Path, int], AbstractContextManager[SerialSession]]
@@ -248,7 +252,7 @@ class Cul868Flasher:
                 raise FlashError(f"could not verify the running CUL868 firmware: {err}") from err
             return version
 
-    def set_led(self, enabled: bool) -> dict[str, object]:
+    def set_led(self, mode: str) -> dict[str, object]:
         """Send a guarded CULFW/TSCULFW LED command to the configured application.
 
         The command is intentionally serialized with flashing and takes the
@@ -257,8 +261,8 @@ class Cul868Flasher:
         persistent LED state because CULFW does not provide command readback.
         """
 
-        if not isinstance(enabled, bool):
-            raise FlashError("CUL LED state must be a boolean")
+        if not isinstance(mode, str) or mode not in {"off", "on", "blink"}:
+            raise FlashError("CUL LED mode must be off, on, or blink")
         with self._flash_lock:
             settings = self._settings_snapshot()
             try:
@@ -275,7 +279,7 @@ class Cul868Flasher:
                             raise FlashError(
                                 "detected CUL firmware does not expose the supported LED command"
                             )
-                        serial.set_led(enabled)
+                        serial.set_led(mode)
                     self._state.save(
                         KnownDevice(
                             application.topology,
@@ -289,11 +293,59 @@ class Cul868Flasher:
                 raise
             except Exception as err:
                 raise FlashError(f"could not set the CUL LED: {err}") from err
-            state = "on" if enabled else "off"
             return {
-                "enabled": enabled,
+                "mode": mode,
                 "version": version,
-                "message": f"CUL LED {state} command was sent after V verification.",
+                "message": f"CUL LED mode {mode} was sent after V verification.",
+            }
+
+    def diagnostics(self) -> dict[str, object]:
+        """Read guarded, non-mutating CUL diagnostics from the application.
+
+        The fixed command set is intentionally limited to V, uptime, and a
+        bare M-Bus status query. In particular, it never exposes a raw serial
+        console or the ``br...`` M-Bus mode-changing command.
+        """
+
+        with self._flash_lock:
+            settings = self._settings_snapshot()
+            try:
+                # Do not interrupt a consumer merely to discover that the CUL
+                # application USB endpoint is absent or in DFU mode.
+                self._configured_application_endpoint(settings)
+                with self._supervisor.temporarily_stop_cul_consumers(
+                    settings.device, settings.additional_cul_addons
+                ):
+                    application, device = self._configured_application_endpoint(settings)
+                    with self._serial_factory(device, settings.baudrate) as serial:
+                        version = serial.version()
+                        uptime_ticks = serial.uptime_ticks()
+                        try:
+                            mbus_mode = serial.mbus_mode()
+                            mbus_status_error = None
+                        except Exception as err:  # noqa: BLE001 - unsupported firmware is optional
+                            mbus_mode = None
+                            mbus_status_error = str(err)[:256]
+                    self._state.save(
+                        KnownDevice(
+                            application.topology,
+                            application.usb_serial,
+                            version,
+                            str(settings.device),
+                            RECOVERY_BINDING_VERIFIED_APPLICATION,
+                        )
+                    )
+            except FlashError:
+                raise
+            except Exception as err:
+                raise FlashError(f"could not read CUL diagnostics: {err}") from err
+            return {
+                "version": version,
+                "uptime_ticks": uptime_ticks,
+                "uptime_seconds": uptime_ticks // 125,
+                "mbus_mode": mbus_mode,
+                "mbus_status_error": mbus_status_error,
+                "message": "Read-only CUL diagnostics completed after V verification.",
             }
 
     def flash(

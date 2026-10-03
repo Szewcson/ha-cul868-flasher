@@ -526,12 +526,12 @@ class FlasherTests(unittest.TestCase):
                 supervisor=supervisor,  # type: ignore[arg-type]
                 serial_factory=serial_factory,  # type: ignore[arg-type]
             )
-            result = flasher.set_led(True)
+            result = flasher.set_led("blink")
             known = state.load()
 
-        self.assertEqual(result["enabled"], True)
+        self.assertEqual(result["mode"], "blink")
         self.assertEqual(result["version"], "V 1.67 CUL868")
-        self.assertEqual(serial_factory.sessions[0].led_states, [True])
+        self.assertEqual(serial_factory.sessions[0].led_modes, ["blink"])
         self.assertEqual(serial_factory.calls, [(Path("/dev/ttyACM0"), 9600)])
         self.assertEqual(supervisor.events, ["stop", "start"])
         self.assertIsNotNone(known)
@@ -550,11 +550,11 @@ class FlasherTests(unittest.TestCase):
                 supervisor=supervisor,  # type: ignore[arg-type]
                 serial_factory=serial_factory,  # type: ignore[arg-type]
             )
-            result = flasher.set_led(False)
+            result = flasher.set_led("off")
 
-        self.assertEqual(result["enabled"], False)
+        self.assertEqual(result["mode"], "off")
         self.assertEqual(result["version"], "VTS 0.43 CUL868")
-        self.assertEqual(serial_factory.sessions[0].led_states, [False])
+        self.assertEqual(serial_factory.sessions[0].led_modes, ["off"])
         self.assertEqual(supervisor.events, ["stop", "start"])
 
     def test_set_led_does_not_pause_consumers_when_application_is_unavailable(self) -> None:
@@ -567,9 +567,54 @@ class FlasherTests(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(FlashError, "configured CUL application is unavailable"):
-            flasher.set_led(True)
+            flasher.set_led("on")
 
         self.assertEqual(supervisor.events, [])
+
+    def test_diagnostics_reads_only_fixed_commands_and_restores_consumers(self) -> None:
+        topology = FakeTopology()
+        supervisor = FakeSupervisor()
+        serial_factory = FakeSerialFactory(topology, ["V 1.67 CUL868"])
+        with tempfile.TemporaryDirectory() as state_directory:
+            flasher = Cul868Flasher(
+                self._settings(),
+                topology=topology,
+                state_store=DeviceStateStore(Path(state_directory)),
+                supervisor=supervisor,  # type: ignore[arg-type]
+                serial_factory=serial_factory,  # type: ignore[arg-type]
+            )
+            result = flasher.diagnostics()
+
+        self.assertEqual(result["version"], "V 1.67 CUL868")
+        self.assertEqual(result["uptime_ticks"], 450_000)
+        self.assertEqual(result["uptime_seconds"], 3_600)
+        self.assertEqual(result["mbus_mode"], "TMODE")
+        self.assertIsNone(result["mbus_status_error"])
+        self.assertEqual(supervisor.events, ["stop", "start"])
+
+    def test_diagnostics_keeps_version_and_uptime_when_mbus_is_unsupported(self) -> None:
+        topology = FakeTopology()
+        supervisor = FakeSupervisor()
+        serial_factory = FakeSerialFactory(
+            topology,
+            ["V 1.67 CUL868"],
+            mbus_mode=RuntimeError("M-Bus command is not supported"),
+        )
+        with tempfile.TemporaryDirectory() as state_directory:
+            flasher = Cul868Flasher(
+                self._settings(),
+                topology=topology,
+                state_store=DeviceStateStore(Path(state_directory)),
+                supervisor=supervisor,  # type: ignore[arg-type]
+                serial_factory=serial_factory,  # type: ignore[arg-type]
+            )
+            result = flasher.diagnostics()
+
+        self.assertEqual(result["version"], "V 1.67 CUL868")
+        self.assertEqual(result["uptime_seconds"], 3_600)
+        self.assertIsNone(result["mbus_mode"])
+        self.assertIn("not supported", str(result["mbus_status_error"]))
+        self.assertEqual(supervisor.events, ["stop", "start"])
 
     def test_startup_verification_does_not_pause_wmbusmeters_in_dfu_mode(self) -> None:
         topology = FakeTopology(mode="bootloader")

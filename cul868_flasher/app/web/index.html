@@ -31,13 +31,26 @@
         <div class="section-heading">
           <p class="eyebrow">Optional control</p>
           <h2 id="led-heading">CUL indicator LED</h2>
-          <p>Available after a recorded <code>V ... CUL868</code> or <code>VTS ... CUL868</code> response from CULFW-derived firmware. Each action verifies the device again before sending the command.</p>
+          <p>Available after a recorded <code>V ... CUL868</code> or <code>VTS ... CUL868</code> response from CULFW-derived firmware. Each action verifies the device again before sending the command. The chosen mode is stored by the firmware.</p>
         </div>
         <div class="button-row">
           <button type="button" class="secondary" data-led-on disabled>Turn LED on</button>
           <button type="button" class="secondary" data-led-off disabled>Turn LED off</button>
+          <button type="button" class="secondary" data-led-blink disabled>Blink LED</button>
         </div>
         <p class="notice" hidden data-led-result></p>
+      </section>
+
+      <section class="diagnostic-card" aria-labelledby="diagnostics-heading">
+        <div class="section-heading">
+          <p class="eyebrow">Read-only diagnostics</p>
+          <h2 id="diagnostics-heading">CUL status</h2>
+          <p>Reads the firmware version, uptime, and current Wireless M-Bus mode. It briefly pauses configured CUL consumers but does not change radio or M-Bus settings.</p>
+        </div>
+        <div class="button-row">
+          <button type="button" class="secondary" data-diagnostics disabled>Run diagnostics</button>
+        </div>
+        <p class="notice" hidden data-diagnostics-result></p>
       </section>
 
       <section class="flash-card" aria-labelledby="flash-heading">

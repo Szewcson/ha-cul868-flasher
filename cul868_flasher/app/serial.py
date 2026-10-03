@@ -9,7 +9,7 @@ import select
 import termios
 from pathlib import Path
 from time import monotonic
-from typing import Self
+from typing import Callable, Self
 
 
 class CulSerialError(RuntimeError):
@@ -25,16 +25,23 @@ _SPEEDS = {
 }
 _READ_LIMIT = 2 * 1024
 _VERSION_PREFIXES = (b"V ", b"VTS ")
+_LED_MODE_COMMANDS = {
+    "off": b"l00\r\n",
+    "on": b"l01\r\n",
+    "blink": b"l02\r\n",
+}
+_MBUS_MODES = frozenset({b"SMODE", b"TMODE", b"CMODE", b"OFF"})
+_HEX_DIGITS = frozenset(b"0123456789abcdefABCDEF")
 
 
 def supports_cul_led_control(version: str) -> bool:
     """Return whether a verified CUL868 version has the CUL LED command.
 
-    CULFW/a-culfw use ``V ... CUL868`` and document ``l00`` and ``l01`` for
-    LED control. TSCULFW uses ``VTS ... CUL868`` but retains the same command:
-    its source registers ``l`` for ``led_func()``, which reads the following
-    byte as the persisted LED mode. Restrict this to the two known version
-    prefixes so an arbitrary CUL868-compatible firmware is not controlled.
+    CULFW/a-culfw document ``l00`` (off), ``l01`` (on), and ``l02`` (blink).
+    TSCULFW uses ``VTS ... CUL868`` but retains the same command: its source
+    registers ``l`` for ``led_func()``, which reads the following byte as the
+    persisted LED mode. Restrict this to the known version prefixes so an
+    arbitrary CUL868-compatible firmware is not controlled.
     """
 
     return version.startswith(("V ", "VTS ")) and "CUL868" in version
@@ -124,26 +131,57 @@ class CulSerial:
             if getattr(err, "errno", None) not in {errno.EIO, errno.ENODEV}:
                 raise CulSerialError(f"CUL bootloader command could not drain: {err}") from err
 
-    def set_led(self, enabled: bool) -> None:
+    def set_led(self, mode: str) -> None:
         """Send the CULFW/TSCULFW LED command after the caller verified ``V``.
 
         CULFW does not echo commands, so draining the serial buffer only proves
         that the command reached the kernel; it is not a readback of LED state.
         """
 
-        if not isinstance(enabled, bool):
-            raise CulSerialError("CUL LED state must be a boolean")
-        self._write_all(b"l01\r\n" if enabled else b"l00\r\n")
+        if not isinstance(mode, str) or mode not in _LED_MODE_COMMANDS:
+            raise CulSerialError("CUL LED mode must be off, on, or blink")
+        self._write_all(_LED_MODE_COMMANDS[mode])
         descriptor = self._require_descriptor()
         try:
             termios.tcdrain(descriptor)
         except (OSError, termios.error) as err:
             raise CulSerialError(f"CUL LED command could not drain: {err}") from err
 
+    def uptime_ticks(self) -> int:
+        """Return the CUL's read-only uptime counter in 1/125-second ticks."""
+
+        line = self._request_line(
+            b"t\r\n",
+            lambda value: len(value) == 8 and all(byte in _HEX_DIGITS for byte in value),
+            "uptime",
+        )
+        return int(line, 16)
+
+    def mbus_mode(self) -> str:
+        """Return the read-only Wireless M-Bus receiver mode.
+
+        A bare ``b`` command only prints the existing mode. It never uses the
+        ``br...`` form that changes receiver configuration.
+        """
+
+        return self._request_line(b"b\r\n", lambda value: value in _MBUS_MODES, "M-Bus")
+
     def _request_version_line(self) -> str:
         """Return one supported CUL version line after the documented CRLF request."""
 
-        self._write_all(b"V\r\n")
+        return self._request_line(
+            b"V\r\n", lambda value: value.startswith(_VERSION_PREFIXES), "V"
+        )
+
+    def _request_line(
+        self,
+        command: bytes,
+        matches: Callable[[bytes], bool],
+        description: str,
+    ) -> str:
+        """Write one fixed command and return its bounded ASCII response line."""
+
+        self._write_all(command)
         descriptor = self._require_descriptor()
         deadline = monotonic() + self._timeout
         response = bytearray()
@@ -158,15 +196,16 @@ class CulSerial:
             if not chunk:
                 continue
             response.extend(chunk)
-            for line in response.replace(b"\r", b"\n").split(b"\n"):
-                if line.startswith(_VERSION_PREFIXES):
+            for buffered_line in response.replace(b"\r", b"\n").split(b"\n"):
+                line = bytes(buffered_line)
+                if matches(line):
                     try:
                         return line.decode("ascii")
                     except UnicodeDecodeError as err:
-                        raise CulSerialError("CUL version response is not ASCII") from err
+                        raise CulSerialError(f"CUL {description} response is not ASCII") from err
             if len(response) >= _READ_LIMIT:
-                raise CulSerialError("CUL version response exceeded the safe read limit")
-        raise CulSerialError("CUL did not answer the V command before the timeout")
+                raise CulSerialError(f"CUL {description} response exceeded the safe read limit")
+        raise CulSerialError(f"CUL did not answer the {description} command before the timeout")
 
     def _write_all(self, data: bytes) -> None:
         descriptor = self._require_descriptor()

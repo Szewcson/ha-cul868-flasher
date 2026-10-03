@@ -11,7 +11,11 @@ const flashButton = document.querySelector("[data-flash]");
 const preflight = document.querySelector("[data-preflight]");
 const ledOnButton = document.querySelector("[data-led-on]");
 const ledOffButton = document.querySelector("[data-led-off]");
+const ledBlinkButton = document.querySelector("[data-led-blink]");
 const ledResult = document.querySelector("[data-led-result]");
+const diagnosticsButton = document.querySelector("[data-diagnostics]");
+const diagnosticsResult = document.querySelector("[data-diagnostics-result]");
+const ledButtons = { on: ledOnButton, off: ledOffButton, blink: ledBlinkButton };
 let artifactId = null;
 let requiresUnpairedRecovery = false;
 
@@ -50,8 +54,8 @@ function supportsLedControl(device) {
 function updateLedControls(device, operation) {
   const busy = operation.status === "queued" || operation.status === "running";
   const enabled = supportsLedControl(device) && !busy;
-  ledOnButton.disabled = !enabled;
-  ledOffButton.disabled = !enabled;
+  Object.values(ledButtons).forEach((button) => { button.disabled = !enabled; });
+  diagnosticsButton.disabled = device.state !== "application" || busy;
 }
 
 async function refresh() {
@@ -160,19 +164,19 @@ flashButton.addEventListener("click", async () => {
   }
 });
 
-async function setLed(enabled) {
-  if ((enabled && ledOnButton.disabled) || (!enabled && ledOffButton.disabled)) return;
-  ledOnButton.disabled = true;
-  ledOffButton.disabled = true;
+async function setLed(mode) {
+  const button = ledButtons[mode];
+  if (!button || button.disabled) return;
+  Object.values(ledButtons).forEach((candidate) => { candidate.disabled = true; });
   ledResult.hidden = false;
-  ledResult.textContent = `Sending CUL LED ${enabled ? "on" : "off"} command...`;
+  ledResult.textContent = `Sending CUL LED ${mode} command...`;
   try {
     const payload = await request("api/led", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ enabled }),
+      body: JSON.stringify({ mode }),
     });
-    ledResult.textContent = payload.message || `CUL LED ${enabled ? "on" : "off"} command sent.`;
+    ledResult.textContent = payload.message || `CUL LED ${mode} command sent.`;
   } catch (error) {
     ledResult.textContent = error.message;
   } finally {
@@ -180,8 +184,38 @@ async function setLed(enabled) {
   }
 }
 
-ledOnButton.addEventListener("click", () => setLed(true));
-ledOffButton.addEventListener("click", () => setLed(false));
+function formatUptime(seconds) {
+  if (!Number.isInteger(seconds) || seconds < 0) return "Unknown";
+  const days = Math.floor(seconds / 86400);
+  const hours = Math.floor((seconds % 86400) / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  return days ? `${days}d ${hours}h ${minutes}m` : `${hours}h ${minutes}m`;
+}
+
+async function runDiagnostics() {
+  if (diagnosticsButton.disabled) return;
+  diagnosticsButton.disabled = true;
+  diagnosticsResult.hidden = false;
+  diagnosticsResult.textContent = "Reading CUL diagnostics...";
+  try {
+    const payload = await request("api/diagnostics", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    });
+    const mbus = payload.mbus_mode || payload.mbus_status_error || "not reported by this firmware";
+    diagnosticsResult.textContent = `Version: ${payload.version || "Unknown"}. Uptime: ${formatUptime(payload.uptime_seconds)}. M-Bus: ${mbus}.`;
+  } catch (error) {
+    diagnosticsResult.textContent = error.message;
+  } finally {
+    refresh();
+  }
+}
+
+ledOnButton.addEventListener("click", () => setLed("on"));
+ledOffButton.addEventListener("click", () => setLed("off"));
+ledBlinkButton.addEventListener("click", () => setLed("blink"));
+diagnosticsButton.addEventListener("click", runDiagnostics);
 
 refresh();
 window.setInterval(refresh, 2000);

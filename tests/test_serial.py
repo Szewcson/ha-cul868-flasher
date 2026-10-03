@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from app.serial import CulSerial, supports_cul_led_control
+from app.serial import CulSerial, CulSerialError, supports_cul_led_control
 
 
 class CulSerialTests(unittest.TestCase):
@@ -45,9 +45,37 @@ class CulSerialTests(unittest.TestCase):
             patch.object(serial, "_write_all") as write_all,
             patch("app.serial.termios.tcdrain") as drain,
         ):
-            serial.set_led(True)
-            serial.set_led(False)
+            serial.set_led("on")
+            serial.set_led("off")
+            serial.set_led("blink")
 
         self.assertEqual(write_all.call_args_list[0].args, (b"l01\r\n",))
         self.assertEqual(write_all.call_args_list[1].args, (b"l00\r\n",))
-        self.assertEqual(drain.call_count, 2)
+        self.assertEqual(write_all.call_args_list[2].args, (b"l02\r\n",))
+        self.assertEqual(drain.call_count, 3)
+
+    def test_led_command_rejects_unknown_modes_before_writing(self) -> None:
+        serial = CulSerial(Path("/dev/ttyACM0"), 9_600)
+
+        with self.assertRaisesRegex(CulSerialError, "off, on, or blink"):
+            serial.set_led("pulse")
+
+    def test_uptime_and_bare_mbus_commands_accept_only_expected_responses(self) -> None:
+        serial = CulSerial(Path("/dev/ttyACM0"), 9_600)
+        serial._descriptor = 42
+        with (
+            patch.object(serial, "_write_all") as write_all,
+            patch("app.serial.select.select", return_value=([42], [], [])),
+            patch("app.serial.os.read", return_value=b"0001E848\r\n"),
+        ):
+            self.assertEqual(serial.uptime_ticks(), 125_000)
+
+        self.assertEqual(write_all.call_args.args, (b"t\r\n",))
+        with (
+            patch.object(serial, "_write_all") as write_all,
+            patch("app.serial.select.select", return_value=([42], [], [])),
+            patch("app.serial.os.read", return_value=b"TMODE\r\n"),
+        ):
+            self.assertEqual(serial.mbus_mode(), "TMODE")
+
+        self.assertEqual(write_all.call_args.args, (b"b\r\n",))

@@ -113,14 +113,24 @@ private configuration can be reviewed safely.
 
 ## LED Control
 
-The Ingress page shows explicit LED on/off buttons only for a recorded
+The Ingress page shows explicit LED on/off/blink buttons only for a recorded
 `V ... CUL868` or `VTS ... CUL868` response. Before each action the app takes
 exclusive serial ownership and verifies `V` again. CULFW/a-culfw documents
-lowercase `l01` for on and `l00` for off in the [CULFW command reference](https://github.com/heliflieger/a-culfw/blob/master/culfw/docs/commandref.html).
+lowercase `l01` for on, `l00` for off, and `l02` for a once-per-second blink
+in the [CULFW command reference](https://github.com/heliflieger/a-culfw/blob/master/culfw/docs/commandref.html).
 TSCULFW retains that command: its source registers `l` for the LED handler,
 which reads the following hexadecimal byte as the LED mode. The command has no
 readback, so the app reports that it sent the command rather than claiming a
 persistent LED state.
+
+## Diagnostics
+
+The manual **Run diagnostics** action pauses known CUL consumers, verifies
+`V`, then reads the non-mutating uptime (`t`) and M-Bus mode (`b`) commands.
+The bare `b` query only reports `SMODE`, `TMODE`, `CMODE`, or `OFF`; the app
+never sends `br...`, which changes receiver configuration. Firmware without
+Wireless M-Bus support may not report a mode, but the version and uptime check
+still complete.
 
 ## Virtual Machines
 

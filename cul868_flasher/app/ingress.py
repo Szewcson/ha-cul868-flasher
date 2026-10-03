@@ -212,7 +212,7 @@ class IngressApi:
             self._artifacts.consume(artifact_id)
         return {"operation_id": operation.operation_id, "state": "queued"}
 
-    def set_led(self, enabled: object) -> dict[str, object]:
+    def set_led(self, mode: object) -> dict[str, object]:
         """Send one guarded CUL LED command when no flash is pending.
 
         Keep admission locked while the flasher acquires its serial lock. This
@@ -220,12 +220,20 @@ class IngressApi:
         command, while the flasher remains the single owner of USB access.
         """
 
-        if not isinstance(enabled, bool):
-            raise IngressError("LED state must be a boolean")
+        if not isinstance(mode, str) or mode not in {"off", "on", "blink"}:
+            raise IngressError("LED mode must be off, on, or blink")
         with self._submission_lock:
             self._require_accepting_mutations_locked()
             self._require_idle()
-            return self._flasher.set_led(enabled)
+            return self._flasher.set_led(mode)
+
+    def diagnostics(self) -> dict[str, object]:
+        """Run one read-only CUL diagnostic session when no flash is pending."""
+
+        with self._submission_lock:
+            self._require_accepting_mutations_locked()
+            self._require_idle()
+            return self._flasher.diagnostics()
 
     @staticmethod
     def discard_image(image: HexImage) -> None:
@@ -373,7 +381,11 @@ class IngressServer:
                         )
                     elif path == "/api/led":
                         body = self._json_body()
-                        response = api.set_led(body.get("enabled"))
+                        response = api.set_led(body.get("mode"))
+                    elif path == "/api/diagnostics":
+                        if self._json_body():
+                            raise IngressError("diagnostic request must be an empty JSON object")
+                        response = api.diagnostics()
                     else:
                         self._json_error(HTTPStatus.NOT_FOUND, "resource was not found")
                         return

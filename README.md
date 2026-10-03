@@ -173,15 +173,23 @@ manually.
 
 ## LED control
 
-The Ingress page can send an explicit **Turn LED on** or **Turn LED off** command
+The Ingress page can send explicit **on**, **off**, or **blink** LED commands
 only after the add-on recorded `V ... CUL868` or `VTS ... CUL868`. It reads `V`
 again while it exclusively owns the serial endpoint before sending the command.
-CULFW and a-culfw document lowercase `l01` for on and `l00` for off in the
+CULFW and a-culfw document lowercase `l01` for on, `l00` for off, and `l02`
+for a once-per-second blink in the
 [CULFW command reference](https://github.com/heliflieger/a-culfw/blob/master/culfw/docs/commandref.html).
 TSCULFW retains that command: its source registers `l` for the LED handler,
 which reads the following hexadecimal byte as the LED mode. The command has no
 readback, so the UI reports that it was sent rather than claiming to observe a
 persistent LED state.
+
+The page also offers a manual, read-only diagnostics check. It verifies `V`,
+reads uptime with `t`, and asks the Wireless M-Bus firmware for its current
+mode with a bare `b`. A bare `b` only reports `SMODE`, `TMODE`, `CMODE`, or
+`OFF`; it never uses the `br...` form that changes receiver mode. Firmware
+without Wireless M-Bus support can still complete diagnostics, but does not
+report a mode.
 
 ## Virtual machines and USB re-enumeration
 

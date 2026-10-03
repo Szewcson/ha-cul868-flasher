@@ -89,11 +89,17 @@ class FakeTopology:
 
 
 class FakeSerial:
-    def __init__(self, topology: FakeTopology, versions: list[str | Exception]) -> None:
+    def __init__(
+        self,
+        topology: FakeTopology,
+        versions: list[str | Exception],
+        mbus_mode: str | Exception,
+    ) -> None:
         self._topology = topology
         self._versions = versions
+        self._mbus_mode = mbus_mode
         self.entered_bootloader = False
-        self.led_states: list[bool] = []
+        self.led_modes: list[str] = []
         self._open = False
 
     def __enter__(self) -> Self:
@@ -115,22 +121,40 @@ class FakeSerial:
         self.entered_bootloader = True
         self._topology.mode = "bootloader"
 
-    def set_led(self, enabled: bool) -> None:
+    def set_led(self, mode: str) -> None:
         if not self._open:
             raise AssertionError("LED command must be sent while the serial session is open")
-        self.led_states.append(enabled)
+        self.led_modes.append(mode)
+
+    def uptime_ticks(self) -> int:
+        if not self._open:
+            raise AssertionError("uptime must be read while the serial session is open")
+        return 125 * 3_600
+
+    def mbus_mode(self) -> str:
+        if not self._open:
+            raise AssertionError("M-Bus mode must be read while the serial session is open")
+        if isinstance(self._mbus_mode, Exception):
+            raise self._mbus_mode
+        return self._mbus_mode
 
 
 class FakeSerialFactory:
-    def __init__(self, topology: FakeTopology, versions: list[str | Exception]) -> None:
+    def __init__(
+        self,
+        topology: FakeTopology,
+        versions: list[str | Exception],
+        mbus_mode: str | Exception = "TMODE",
+    ) -> None:
         self._topology = topology
         self._versions = versions
+        self._mbus_mode = mbus_mode
         self.calls: list[tuple[Path, int]] = []
         self.sessions: list[FakeSerial] = []
 
     def __call__(self, device: Path, baudrate: int) -> FakeSerial:
         self.calls.append((device, baudrate))
-        session = FakeSerial(self._topology, self._versions)
+        session = FakeSerial(self._topology, self._versions, self._mbus_mode)
         self.sessions.append(session)
         return session
 

@@ -19,7 +19,7 @@ from .helpers import minimal_hex
 class _IngressFlasher:
     def __init__(self, preflight: FlashPreflight | None = None) -> None:
         self._preflight = preflight or FlashPreflight("application", "2-3", "Ready to verify")
-        self.led_states: list[bool] = []
+        self.led_modes: list[str] = []
 
     def status(self) -> dict[str, object]:
         return {"state": "application", "topology": "2-3", "message": "Ready"}
@@ -27,12 +27,22 @@ class _IngressFlasher:
     def preflight(self) -> FlashPreflight:
         return self._preflight
 
-    def set_led(self, enabled: bool) -> dict[str, object]:
-        self.led_states.append(enabled)
+    def set_led(self, mode: str) -> dict[str, object]:
+        self.led_modes.append(mode)
         return {
-            "enabled": enabled,
+            "mode": mode,
             "version": "V 1.67 CUL868",
-            "message": f"CULFW LED {'on' if enabled else 'off'} command was sent.",
+            "message": f"CULFW LED {mode} command was sent.",
+        }
+
+    def diagnostics(self) -> dict[str, object]:
+        return {
+            "version": "V 1.67 CUL868",
+            "uptime_ticks": 450_000,
+            "uptime_seconds": 3_600,
+            "mbus_mode": "TMODE",
+            "mbus_status_error": None,
+            "message": "Read-only CUL diagnostics completed.",
         }
 
 
@@ -95,22 +105,40 @@ class IngressApiTests(unittest.TestCase):
             assert operation is not None
             api.discard_image(operation.image)
 
-    def test_led_control_requires_a_boolean_and_an_idle_flash_queue(self) -> None:
+    def test_led_control_requires_a_known_mode_and_an_idle_flash_queue(self) -> None:
         controller = OperationController()
         flasher = _IngressFlasher()
         with tempfile.TemporaryDirectory() as directory:
             api = IngressApi(controller, flasher, Path(directory))  # type: ignore[arg-type]
 
-            response = api.set_led(True)
-            self.assertEqual(response["enabled"], True)
-            self.assertEqual(flasher.led_states, [True])
-            with self.assertRaisesRegex(IngressError, "must be a boolean"):
-                api.set_led("true")
+            response = api.set_led("blink")
+            self.assertEqual(response["mode"], "blink")
+            self.assertEqual(flasher.led_modes, ["blink"])
+            with self.assertRaisesRegex(IngressError, "off, on, or blink"):
+                api.set_led("pulse")
 
             staged = api.validate_upload(io.BytesIO(minimal_hex()), len(minimal_hex()))
             api.flash(staged["artifact_id"], True, None)
             with self.assertRaises(OperationBusyError):
-                api.set_led(False)
+                api.set_led("off")
+            operation = controller.get(timeout=0)
+            assert operation is not None
+            api.discard_image(operation.image)
+
+    def test_diagnostics_requires_an_idle_flash_queue(self) -> None:
+        controller = OperationController()
+        flasher = _IngressFlasher()
+        with tempfile.TemporaryDirectory() as directory:
+            api = IngressApi(controller, flasher, Path(directory))  # type: ignore[arg-type]
+
+            response = api.diagnostics()
+            self.assertEqual(response["uptime_seconds"], 3_600)
+            self.assertEqual(response["mbus_mode"], "TMODE")
+
+            staged = api.validate_upload(io.BytesIO(minimal_hex()), len(minimal_hex()))
+            api.flash(staged["artifact_id"], True, None)
+            with self.assertRaises(OperationBusyError):
+                api.diagnostics()
             operation = controller.get(timeout=0)
             assert operation is not None
             api.discard_image(operation.image)
@@ -277,7 +305,7 @@ class IngressServerTests(unittest.TestCase):
             self.assertIn("Ingress request header", payload["error"])
 
             connection = http.client.HTTPConnection("127.0.0.1", server.port, timeout=5)
-            body = json.dumps({"enabled": False}).encode()
+            body = json.dumps({"mode": "off"}).encode()
             connection.request(
                 "POST",
                 "/api/led",
@@ -290,6 +318,21 @@ class IngressServerTests(unittest.TestCase):
             response = connection.getresponse()
             payload = json.loads(response.read())
             self.assertEqual(response.status, 200)
-            self.assertEqual(payload["enabled"], False)
+            self.assertEqual(payload["mode"], "off")
+
+            connection = http.client.HTTPConnection("127.0.0.1", server.port, timeout=5)
+            connection.request(
+                "POST",
+                "/api/diagnostics",
+                b"{}",
+                {
+                    "Content-Type": "application/json",
+                    "X-Requested-With": "XMLHttpRequest",
+                },
+            )
+            response = connection.getresponse()
+            payload = json.loads(response.read())
+            self.assertEqual(response.status, 200)
+            self.assertEqual(payload["mbus_mode"], "TMODE")
         finally:
             server.stop()

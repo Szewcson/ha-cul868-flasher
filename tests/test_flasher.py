@@ -641,6 +641,31 @@ class FlasherTests(unittest.TestCase):
         self.assertIn("not supported", str(result["uptime_status_error"]))
         self.assertEqual(supervisor.events, ["stop", "start"])
 
+    def test_diagnostics_retries_the_tsculf_version_request(self) -> None:
+        topology = FakeTopology()
+        supervisor = FakeSupervisor()
+        serial_factory = FakeSerialFactory(
+            topology,
+            [
+                RuntimeError("CUL did not answer the V command before the timeout"),
+                "VTS 0.43 CUL868",
+            ],
+        )
+        with tempfile.TemporaryDirectory() as state_directory:
+            flasher = Cul868Flasher(
+                self._settings(),
+                topology=topology,
+                state_store=DeviceStateStore(Path(state_directory)),
+                supervisor=supervisor,  # type: ignore[arg-type]
+                serial_factory=serial_factory,  # type: ignore[arg-type]
+                sleep_fn=lambda _seconds: None,
+            )
+            result = flasher.diagnostics()
+
+        self.assertEqual(result["version"], "VTS 0.43 CUL868")
+        self.assertEqual(len(serial_factory.sessions), 3)
+        self.assertEqual(supervisor.events, ["stop", "start"])
+
     def test_startup_verification_does_not_pause_wmbusmeters_in_dfu_mode(self) -> None:
         topology = FakeTopology(mode="bootloader")
         supervisor = FakeSupervisor()

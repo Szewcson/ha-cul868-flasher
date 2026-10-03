@@ -317,8 +317,10 @@ class Cul868Flasher:
                     settings.device, settings.additional_cul_addons
                 ):
                     application, device = self._configured_application_endpoint(settings)
+                    # Share startup and flashing's bounded V retry path. TSCULFW
+                    # can need a fresh CDC session after a consumer releases it.
+                    version = self._read_version(device, settings.baudrate)
                     with self._serial_factory(device, settings.baudrate) as serial:
-                        version = serial.version()
                         try:
                             uptime_ticks = serial.uptime_ticks()
                             uptime_status_error = None

@@ -7,9 +7,10 @@ import fcntl
 import os
 import select
 import termios
+from collections.abc import Callable
 from pathlib import Path
 from time import monotonic
-from typing import Callable, Self
+from typing import Self
 
 
 class CulSerialError(RuntimeError):

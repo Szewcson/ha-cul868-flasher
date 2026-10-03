@@ -40,6 +40,7 @@ class _IngressFlasher:
             "version": "V 1.67 CUL868",
             "uptime_ticks": 450_000,
             "uptime_seconds": 3_600,
+            "uptime_status_error": None,
             "mbus_mode": "TMODE",
             "mbus_status_error": None,
             "message": "Read-only CUL diagnostics completed.",

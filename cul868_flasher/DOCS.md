@@ -128,9 +128,9 @@ persistent LED state.
 The manual **Run diagnostics** action pauses known CUL consumers, verifies
 `V`, then reads the non-mutating uptime (`t`) and M-Bus mode (`b`) commands.
 The bare `b` query only reports `SMODE`, `TMODE`, `CMODE`, or `OFF`; the app
-never sends `br...`, which changes receiver configuration. Firmware without
-Wireless M-Bus support may not report a mode, but the version and uptime check
-still complete.
+never sends `br...`, which changes receiver configuration. Firmware may omit
+uptime and Wireless M-Bus responses; the verified version is still reported,
+with unavailable telemetry shown per field.
 
 ## Virtual Machines
 

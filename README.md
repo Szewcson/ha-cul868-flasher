@@ -188,8 +188,8 @@ The page also offers a manual, read-only diagnostics check. It verifies `V`,
 reads uptime with `t`, and asks the Wireless M-Bus firmware for its current
 mode with a bare `b`. A bare `b` only reports `SMODE`, `TMODE`, `CMODE`, or
 `OFF`; it never uses the `br...` form that changes receiver mode. Firmware
-without Wireless M-Bus support can still complete diagnostics, but does not
-report a mode.
+may omit uptime and Wireless M-Bus support; a verified `V` response still
+completes diagnostics and reports unavailable telemetry per field.
 
 ## Virtual machines and USB re-enumeration
 

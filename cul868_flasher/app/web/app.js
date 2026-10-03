@@ -203,8 +203,11 @@ async function runDiagnostics() {
       headers: { "Content-Type": "application/json" },
       body: "{}",
     });
+    const uptime = Number.isInteger(payload.uptime_seconds)
+      ? formatUptime(payload.uptime_seconds)
+      : payload.uptime_status_error || "not reported by this firmware";
     const mbus = payload.mbus_mode || payload.mbus_status_error || "not reported by this firmware";
-    diagnosticsResult.textContent = `Version: ${payload.version || "Unknown"}. Uptime: ${formatUptime(payload.uptime_seconds)}. M-Bus: ${mbus}.`;
+    diagnosticsResult.textContent = `Version: ${payload.version || "Unknown"}. Uptime: ${uptime}. M-Bus: ${mbus}.`;
   } catch (error) {
     diagnosticsResult.textContent = error.message;
   } finally {

@@ -94,10 +94,12 @@ class FakeSerial:
         topology: FakeTopology,
         versions: list[str | Exception],
         mbus_mode: str | Exception,
+        uptime_ticks: int | Exception,
     ) -> None:
         self._topology = topology
         self._versions = versions
         self._mbus_mode = mbus_mode
+        self._uptime_ticks = uptime_ticks
         self.entered_bootloader = False
         self.led_modes: list[str] = []
         self._open = False
@@ -129,7 +131,9 @@ class FakeSerial:
     def uptime_ticks(self) -> int:
         if not self._open:
             raise AssertionError("uptime must be read while the serial session is open")
-        return 125 * 3_600
+        if isinstance(self._uptime_ticks, Exception):
+            raise self._uptime_ticks
+        return self._uptime_ticks
 
     def mbus_mode(self) -> str:
         if not self._open:
@@ -145,16 +149,24 @@ class FakeSerialFactory:
         topology: FakeTopology,
         versions: list[str | Exception],
         mbus_mode: str | Exception = "TMODE",
+        *,
+        uptime_ticks: int | Exception = 125 * 3_600,
     ) -> None:
         self._topology = topology
         self._versions = versions
         self._mbus_mode = mbus_mode
+        self._uptime_ticks = uptime_ticks
         self.calls: list[tuple[Path, int]] = []
         self.sessions: list[FakeSerial] = []
 
     def __call__(self, device: Path, baudrate: int) -> FakeSerial:
         self.calls.append((device, baudrate))
-        session = FakeSerial(self._topology, self._versions, self._mbus_mode)
+        session = FakeSerial(
+            self._topology,
+            self._versions,
+            self._mbus_mode,
+            self._uptime_ticks,
+        )
         self.sessions.append(session)
         return session
 

@@ -588,6 +588,7 @@ class FlasherTests(unittest.TestCase):
         self.assertEqual(result["version"], "V 1.67 CUL868")
         self.assertEqual(result["uptime_ticks"], 450_000)
         self.assertEqual(result["uptime_seconds"], 3_600)
+        self.assertIsNone(result["uptime_status_error"])
         self.assertEqual(result["mbus_mode"], "TMODE")
         self.assertIsNone(result["mbus_status_error"])
         self.assertEqual(supervisor.events, ["stop", "start"])
@@ -614,6 +615,30 @@ class FlasherTests(unittest.TestCase):
         self.assertEqual(result["uptime_seconds"], 3_600)
         self.assertIsNone(result["mbus_mode"])
         self.assertIn("not supported", str(result["mbus_status_error"]))
+        self.assertEqual(supervisor.events, ["stop", "start"])
+
+    def test_diagnostics_keeps_version_when_uptime_is_unavailable(self) -> None:
+        topology = FakeTopology()
+        supervisor = FakeSupervisor()
+        serial_factory = FakeSerialFactory(
+            topology,
+            ["VTS 0.43 CUL868"],
+            uptime_ticks=RuntimeError("uptime command is not supported"),
+        )
+        with tempfile.TemporaryDirectory() as state_directory:
+            flasher = Cul868Flasher(
+                self._settings(),
+                topology=topology,
+                state_store=DeviceStateStore(Path(state_directory)),
+                supervisor=supervisor,  # type: ignore[arg-type]
+                serial_factory=serial_factory,  # type: ignore[arg-type]
+            )
+            result = flasher.diagnostics()
+
+        self.assertEqual(result["version"], "VTS 0.43 CUL868")
+        self.assertIsNone(result["uptime_ticks"])
+        self.assertIsNone(result["uptime_seconds"])
+        self.assertIn("not supported", str(result["uptime_status_error"]))
         self.assertEqual(supervisor.events, ["stop", "start"])
 
     def test_startup_verification_does_not_pause_wmbusmeters_in_dfu_mode(self) -> None:

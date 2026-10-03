@@ -319,7 +319,12 @@ class Cul868Flasher:
                     application, device = self._configured_application_endpoint(settings)
                     with self._serial_factory(device, settings.baudrate) as serial:
                         version = serial.version()
-                        uptime_ticks = serial.uptime_ticks()
+                        try:
+                            uptime_ticks = serial.uptime_ticks()
+                            uptime_status_error = None
+                        except Exception as err:  # noqa: BLE001 - unsupported firmware is optional
+                            uptime_ticks = None
+                            uptime_status_error = str(err)[:256]
                         try:
                             mbus_mode = serial.mbus_mode()
                             mbus_status_error = None
@@ -342,7 +347,8 @@ class Cul868Flasher:
             return {
                 "version": version,
                 "uptime_ticks": uptime_ticks,
-                "uptime_seconds": uptime_ticks // 125,
+                "uptime_seconds": uptime_ticks // 125 if uptime_ticks is not None else None,
+                "uptime_status_error": uptime_status_error,
                 "mbus_mode": mbus_mode,
                 "mbus_status_error": mbus_status_error,
                 "message": "Read-only CUL diagnostics completed after V verification.",

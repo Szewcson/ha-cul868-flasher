@@ -315,11 +315,18 @@ class Cul868Flasher:
                 self._configured_application_endpoint(settings)
                 with self._supervisor.temporarily_stop_cul_consumers(
                     settings.device, settings.additional_cul_addons
-                ):
+                ) as pause:
                     application, device = self._configured_application_endpoint(settings)
                     # Share startup and flashing's bounded V retry path. TSCULFW
                     # can need a fresh CDC session after a consumer releases it.
-                    version = self._read_version(device, settings.baudrate)
+                    try:
+                        version = self._read_version(device, settings.baudrate)
+                    except FlashError as err:
+                        paused = ", ".join(pause.addons) or "no matching CUL consumer apps"
+                        raise FlashError(
+                            "could not read CUL diagnostics from "
+                            f"{device} at {settings.baudrate} baud after pausing {paused}: {err}"
+                        ) from err
                     with self._serial_factory(device, settings.baudrate) as serial:
                         try:
                             uptime_ticks = serial.uptime_ticks()

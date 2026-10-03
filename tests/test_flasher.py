@@ -666,6 +666,35 @@ class FlasherTests(unittest.TestCase):
         self.assertEqual(len(serial_factory.sessions), 3)
         self.assertEqual(supervisor.events, ["stop", "start"])
 
+    def test_diagnostics_reports_paused_consumers_when_version_never_answers(self) -> None:
+        topology = FakeTopology()
+        supervisor = FakeSupervisor(paused=("c8a990ad_wmbusmeters-ha-addon",))
+        serial_factory = FakeSerialFactory(
+            topology,
+            [
+                RuntimeError("CUL did not answer the V command before the timeout"),
+                RuntimeError("CUL did not answer the V command before the timeout"),
+                RuntimeError("CUL did not answer the V command before the timeout"),
+            ],
+        )
+        with tempfile.TemporaryDirectory() as state_directory:
+            flasher = Cul868Flasher(
+                self._settings(),
+                topology=topology,
+                state_store=DeviceStateStore(Path(state_directory)),
+                supervisor=supervisor,  # type: ignore[arg-type]
+                serial_factory=serial_factory,  # type: ignore[arg-type]
+                sleep_fn=lambda _seconds: None,
+            )
+            with self.assertRaisesRegex(
+                FlashError,
+                "after pausing c8a990ad_wmbusmeters-ha-addon",
+            ):
+                flasher.diagnostics()
+
+        self.assertEqual(len(serial_factory.sessions), 3)
+        self.assertEqual(supervisor.events, ["stop", "start"])
+
     def test_startup_verification_does_not_pause_wmbusmeters_in_dfu_mode(self) -> None:
         topology = FakeTopology(mode="bootloader")
         supervisor = FakeSupervisor()

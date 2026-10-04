@@ -111,6 +111,11 @@ CUL consumer apps** to pause it, or stop unmanaged consumers manually. An
 explicitly listed app remains stopped after a descriptor alias migration so its
 private configuration can be reviewed safely.
 
+An explicitly listed slug takes priority over automatic matching. Use this as a
+safe fallback when a known app has an unusual configuration the flasher cannot
+inspect. Get the exact Wmbusmeters slug from `ha apps list`; its repository
+prefix can differ between installations.
+
 ## LED Control
 
 The Ingress page shows explicit LED on/off/blink buttons only for a recorded

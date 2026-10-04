@@ -182,7 +182,7 @@ class SupervisorLifecycleTests(unittest.TestCase):
                     return {
                         "data": {
                             "addons": [
-                                {"slug": "wmbusmeters-ha-addon"},
+                                {"slug": "c8a990ad_wmbusmeters-ha-addon"},
                                 {"slug": "wmbusmeters-ha-addon-edge"},
                                 {"slug": "f591d177_max2mqtt"},
                                 {"slug": "local_homegear", "state": "started"},
@@ -191,7 +191,7 @@ class SupervisorLifecycleTests(unittest.TestCase):
                             ]
                         }
                     }
-                if path == "/addons/wmbusmeters-ha-addon/info":
+                if path == "/addons/c8a990ad_wmbusmeters-ha-addon/info":
                     return {
                         "data": {
                             "state": "started",
@@ -220,10 +220,34 @@ class SupervisorLifecycleTests(unittest.TestCase):
                 Path("/dev/ttyACM0"), ("local_homegear",)
             ),
             CulConsumerPause(
-                wmbusmeters_addons=("wmbusmeters-ha-addon",),
+                wmbusmeters_addons=("c8a990ad_wmbusmeters-ha-addon",),
                 max2mqtt_addons=("f591d177_max2mqtt",),
                 additional_addons=("local_homegear",),
             ),
+        )
+
+    def test_explicit_consumer_selection_overrides_known_schema_matching(self) -> None:
+        class OptionsSupervisor(SupervisorClient):
+            def _request(self, method: str, path: str) -> dict[str, object]:
+                if method != "GET" or path != "/addons":
+                    raise AssertionError(f"unexpected Supervisor request: {method} {path}")
+                return {
+                    "data": {
+                        "addons": [
+                            {
+                                "slug": "c8a990ad_wmbusmeters-ha-addon",
+                                "state": "started",
+                            }
+                        ]
+                    }
+                }
+
+        client = OptionsSupervisor.__new__(OptionsSupervisor)
+        self.assertEqual(
+            client.running_cul_consumers_using_device(
+                Path("/dev/ttyACM0"), ("c8a990ad_wmbusmeters-ha-addon",)
+            ),
+            CulConsumerPause(additional_addons=("c8a990ad_wmbusmeters-ha-addon",)),
         )
 
     def test_reads_only_canonical_by_id_paths_from_matching_hardware_records(self) -> None:

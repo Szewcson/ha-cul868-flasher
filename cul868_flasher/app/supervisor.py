@@ -128,6 +128,13 @@ class SupervisorClient:
             if not isinstance(addon, dict):
                 continue
             slug = addon.get("slug")
+            # An explicit operator selection takes priority over automatic
+            # schema matching. This is a safe fallback for a known consumer
+            # whose options use a private or future configuration shape.
+            if isinstance(slug, str) and slug in additional:
+                if addon.get("state") == "started":
+                    opted_in.append(slug)
+                continue
             if _is_wmbusmeters_slug(slug):
                 info = self._addon_info(slug)
                 if info.get("state") == "started" and _wmbusmeters_uses_device(
@@ -140,8 +147,6 @@ class SupervisorClient:
                     info.get("options"), device
                 ):
                     max2mqtt.append(slug)
-            elif isinstance(slug, str) and slug in additional and addon.get("state") == "started":
-                opted_in.append(slug)
         return CulConsumerPause(
             wmbusmeters_addons=tuple(sorted(set(wmbusmeters))),
             max2mqtt_addons=tuple(sorted(set(max2mqtt))),

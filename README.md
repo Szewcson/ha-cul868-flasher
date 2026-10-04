@@ -151,12 +151,17 @@ usually live in service-private configuration files, so the flasher cannot
 safely infer one from the public Supervisor or Core APIs.
 For a known FHEM, Homegear, or similar serial bridge app, add its exact
 Supervisor slug to **Additional CUL consumer apps**. Find the slug with
-`ha addons list` in the Home Assistant Terminal/SSH app. The flasher then
+`ha apps list` in the Home Assistant Terminal/SSH app. The flasher then
 pauses only that running app for verification and flashing. If a firmware
 changes the serial-by-id name, explicitly configured apps remain stopped after
 an otherwise successful flash; update their own CUL path and restart them
 manually. This coordinates only Home Assistant apps: a remote or standalone
 FHEM/Homegear server must be stopped manually before flashing.
+
+An explicitly listed slug takes priority over automatic matching. This is also
+a safe fallback for a known app whose current options use a configuration shape
+the flasher cannot inspect. Get the exact Wmbusmeters slug from `ha apps list`;
+its repository prefix can differ between installations.
 
 Custom Core integrations such as MaxCUL, Node-RED flows, and non-add-on
 serial-to-MQTT bridges cannot be discovered or stopped safely from an app.

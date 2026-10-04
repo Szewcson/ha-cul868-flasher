@@ -4,6 +4,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Self
 
 from app.flasher import Cul868Flasher, FlashError
 from app.hexfile import parse_hex_file
@@ -594,7 +595,7 @@ class FlasherTests(unittest.TestCase):
                 self.calls += 1
                 return self
 
-            def __enter__(self) -> FailingLedSession:
+            def __enter__(self) -> Self:
                 return self
 
             def __exit__(

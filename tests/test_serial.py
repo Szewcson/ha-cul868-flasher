@@ -25,9 +25,9 @@ class CulSerialTests(unittest.TestCase):
             patch("app.serial.termios.tcgetattr", side_effect=[original, configured]),
             patch("app.serial.termios.tcsetattr") as set_attributes,
             patch("app.serial.termios.tcflush"),
+            serial,
         ):
-            with serial:
-                pass
+            pass
 
         self.assertEqual(set_attributes.call_args_list[0].args[2][4], termios.B115200)
         self.assertEqual(set_attributes.call_args_list[0].args[2][5], termios.B115200)
@@ -46,9 +46,9 @@ class CulSerialTests(unittest.TestCase):
             patch("app.serial.termios.tcgetattr", side_effect=[original, configured]),
             patch("app.serial.termios.tcsetattr") as set_attributes,
             patch("app.serial.termios.tcflush"),
+            serial,
         ):
-            with serial:
-                pass
+            pass
 
         self.assertEqual(set_attributes.call_args_list[0].args[2][4], termios.B9600)
         self.assertEqual(set_attributes.call_args_list[0].args[2][5], termios.B9600)

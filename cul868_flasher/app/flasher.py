@@ -1210,7 +1210,7 @@ class Cul868Flasher:
             except FlashError:
                 raise
             # Serial adapters expose platform-specific transport exceptions.
-            except Exception as err:  # noqa: BLE001
+            except Exception as err:
                 if led_command_started:
                     raise FlashError(
                         f"CUL LED command may have been sent and will not be retried: {err}"

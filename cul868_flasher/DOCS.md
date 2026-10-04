@@ -132,6 +132,12 @@ never sends `br...`, which changes receiver configuration. Firmware may omit
 uptime and Wireless M-Bus responses; the verified version is still reported,
 with unavailable telemetry shown per field.
 
+Each exclusive CUL session toggles and restores the logical USB CDC line
+coding before it sends a CUL command. This makes Linux send a fresh
+`SET_LINE_CODING` request when a guest-side USB state loss leaves a present
+CUL V3 tty silent. It is a USB control transfer only: it does not reset the
+radio, change the CUL protocol baud rate, or send a radio command.
+
 ## Virtual Machines
 
 The radio changes identity between `03eb:204b` and `03eb:2ff4`. Pass both

@@ -557,6 +557,77 @@ class FlasherTests(unittest.TestCase):
         self.assertEqual(serial_factory.sessions[0].led_modes, ["off"])
         self.assertEqual(supervisor.events, ["stop", "start"])
 
+    def test_set_led_retries_verification_before_sending_the_command(self) -> None:
+        topology = FakeTopology()
+        supervisor = FakeSupervisor()
+        serial_factory = FakeSerialFactory(
+            topology,
+            [
+                RuntimeError("CUL did not answer the V command before the timeout"),
+                "VTS 0.43 CUL868",
+            ],
+        )
+        with tempfile.TemporaryDirectory() as state_directory:
+            flasher = Cul868Flasher(
+                self._settings(),
+                topology=topology,
+                state_store=DeviceStateStore(Path(state_directory)),
+                supervisor=supervisor,  # type: ignore[arg-type]
+                serial_factory=serial_factory,  # type: ignore[arg-type]
+                sleep_fn=lambda _seconds: None,
+            )
+            result = flasher.set_led("on")
+
+        self.assertEqual(result["version"], "VTS 0.43 CUL868")
+        self.assertEqual(len(serial_factory.sessions), 2)
+        self.assertEqual(serial_factory.sessions[0].led_modes, [])
+        self.assertEqual(serial_factory.sessions[1].led_modes, ["on"])
+        self.assertEqual(supervisor.events, ["stop", "start"])
+
+    def test_set_led_does_not_retry_an_ambiguous_led_write(self) -> None:
+        class FailingLedSession:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.writes = 0
+
+            def __call__(self, _device: Path, _baudrate: int) -> FailingLedSession:
+                self.calls += 1
+                return self
+
+            def __enter__(self) -> FailingLedSession:
+                return self
+
+            def __exit__(
+                self, _exc_type: object, _exc_value: object, _traceback: object
+            ) -> None:
+                return None
+
+            @staticmethod
+            def version() -> str:
+                return "V 1.67 CUL868"
+
+            def set_led(self, _mode: str) -> None:
+                self.writes += 1
+                raise RuntimeError("serial device disconnected during LED write")
+
+        topology = FakeTopology()
+        supervisor = FakeSupervisor()
+        session = FailingLedSession()
+        flasher = Cul868Flasher(
+            self._settings(),
+            topology=topology,
+            supervisor=supervisor,  # type: ignore[arg-type]
+            serial_factory=session,  # type: ignore[arg-type]
+            sleep_fn=lambda _seconds: None,
+        )
+
+        with self.assertRaisesRegex(FlashError, "will not be retried"):
+            flasher.set_led("on")
+
+        self.assertEqual(session.calls, 1)
+        self.assertEqual(session.writes, 1)
+        self.assertEqual(supervisor.events, ["stop", "start"])
+
     def test_set_led_does_not_pause_consumers_when_application_is_unavailable(self) -> None:
         topology = FakeTopology(mode="bootloader")
         supervisor = FakeSupervisor()

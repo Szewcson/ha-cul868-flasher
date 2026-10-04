@@ -82,12 +82,34 @@ class CulSerial:
             attributes[5] = _SPEEDS[self._baudrate]
             attributes[6][termios.VMIN] = 0
             attributes[6][termios.VTIME] = 0
-            termios.tcsetattr(descriptor, termios.TCSANOW, attributes)
+            self._reassert_cdc_line_coding(descriptor, attributes)
             termios.tcflush(descriptor, termios.TCIOFLUSH)
             return self
         except (OSError, termios.error) as err:
             self.__exit__(None, None, None)
             raise CulSerialError(f"cannot configure CUL serial device {self._device}: {err}") from err
+
+    def _reassert_cdc_line_coding(self, descriptor: int, attributes: list[object]) -> None:
+        """Force Linux to resend the CUL V3 CDC line-coding control request.
+
+        CUL V3's LUFA CDC implementation clears ``LineCoding.DataBits`` after
+        a USB configuration change and rejects CDC traffic until the host sends
+        ``SET_LINE_CODING``. Linux's cdc-acm driver normally skips that USB
+        request when its cached line coding already matches 8N1 at the selected
+        baud rate. Toggle only the logical CDC baud rate, then immediately
+        restore it, so a guest-side USB state loss cannot leave a present tty
+        silent. Native-USB CUL V3 firmware does not use this setting for its
+        CUL protocol, and this method sends no CUL command or reset.
+        """
+
+        alternate_speed = (
+            _SPEEDS[115_200] if self._baudrate != 115_200 else _SPEEDS[9_600]
+        )
+        recovery_attributes = attributes.copy()
+        recovery_attributes[4] = alternate_speed
+        recovery_attributes[5] = alternate_speed
+        termios.tcsetattr(descriptor, termios.TCSANOW, recovery_attributes)
+        termios.tcsetattr(descriptor, termios.TCSANOW, attributes)
 
     def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
         del exc_type, exc_value, traceback

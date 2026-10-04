@@ -271,15 +271,18 @@ class Cul868Flasher:
                 self._configured_application_endpoint(settings)
                 with self._supervisor.temporarily_stop_cul_consumers(
                     settings.device, settings.additional_cul_addons
-                ):
+                ) as pause:
                     application, device = self._configured_application_endpoint(settings)
-                    with self._serial_factory(device, settings.baudrate) as serial:
-                        version = serial.version()
-                        if not supports_cul_led_control(version):
-                            raise FlashError(
-                                "detected CUL firmware does not expose the supported LED command"
-                            )
-                        serial.set_led(mode)
+                    try:
+                        version = self._set_led_after_verification(
+                            device, settings.baudrate, mode
+                        )
+                    except FlashError as err:
+                        paused = ", ".join(pause.addons) or "no matching CUL consumer apps"
+                        raise FlashError(
+                            f"could not set CUL LED on {device} at {settings.baudrate} baud "
+                            f"after pausing {paused}: {err}"
+                        ) from err
                     self._state.save(
                         KnownDevice(
                             application.topology,
@@ -1185,6 +1188,41 @@ class Cul868Flasher:
 
         with self._serial_factory(device, baudrate) as serial:
             return serial.version()
+
+    def _set_led_after_verification(self, device: Path, baudrate: int, mode: str) -> str:
+        """Verify a CUL before one LED write without retrying an ambiguous write."""
+
+        last_error: Exception | None = None
+        for attempt in range(1, _VERSION_READ_ATTEMPTS + 1):
+            led_command_started = False
+            try:
+                with self._serial_factory(device, baudrate) as serial:
+                    version = serial.version()
+                    if not supports_cul_led_control(version):
+                        raise FlashError(
+                            "detected CUL firmware does not expose the supported LED command"
+                        )
+                    # A failure after this call can mean the write reached the
+                    # radio. Retrying could issue a second LED command.
+                    led_command_started = True
+                    serial.set_led(mode)
+                    return version
+            except FlashError:
+                raise
+            # Serial adapters expose platform-specific transport exceptions.
+            except Exception as err:  # noqa: BLE001
+                if led_command_started:
+                    raise FlashError(
+                        f"CUL LED command may have been sent and will not be retried: {err}"
+                    ) from err
+                last_error = err
+                if attempt != _VERSION_READ_ATTEMPTS:
+                    self._sleep(_VERSION_RETRY_SECONDS)
+        assert last_error is not None
+        raise FlashError(
+            "CUL868 did not provide a valid V response before the LED command "
+            f"after {_VERSION_READ_ATTEMPTS} attempts: {last_error}"
+        ) from last_error
 
     def _run_dfu(
         self,

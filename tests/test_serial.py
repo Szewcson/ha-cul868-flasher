@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import termios
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -8,6 +9,52 @@ from app.serial import CulSerial, CulSerialError, supports_cul_led_control
 
 
 class CulSerialTests(unittest.TestCase):
+    @staticmethod
+    def _attributes(speed: int) -> list[object]:
+        return [0, 0, termios.CS8, 0, speed, speed, [0] * 32]
+
+    def test_open_reasserts_cdc_line_coding_before_using_the_cul(self) -> None:
+        original = self._attributes(termios.B9600)
+        configured = self._attributes(termios.B9600)
+        serial = CulSerial(Path("/dev/ttyACM0"), 9_600)
+
+        with (
+            patch("app.serial.os.open", return_value=42),
+            patch("app.serial.os.close"),
+            patch("app.serial.fcntl.ioctl"),
+            patch("app.serial.termios.tcgetattr", side_effect=[original, configured]),
+            patch("app.serial.termios.tcsetattr") as set_attributes,
+            patch("app.serial.termios.tcflush"),
+        ):
+            with serial:
+                pass
+
+        self.assertEqual(set_attributes.call_args_list[0].args[2][4], termios.B115200)
+        self.assertEqual(set_attributes.call_args_list[0].args[2][5], termios.B115200)
+        self.assertEqual(set_attributes.call_args_list[1].args[2][4], termios.B9600)
+        self.assertEqual(set_attributes.call_args_list[1].args[2][5], termios.B9600)
+
+    def test_open_reasserts_115200_with_9600_as_the_alternate_speed(self) -> None:
+        original = self._attributes(termios.B115200)
+        configured = self._attributes(termios.B115200)
+        serial = CulSerial(Path("/dev/ttyACM0"), 115_200)
+
+        with (
+            patch("app.serial.os.open", return_value=42),
+            patch("app.serial.os.close"),
+            patch("app.serial.fcntl.ioctl"),
+            patch("app.serial.termios.tcgetattr", side_effect=[original, configured]),
+            patch("app.serial.termios.tcsetattr") as set_attributes,
+            patch("app.serial.termios.tcflush"),
+        ):
+            with serial:
+                pass
+
+        self.assertEqual(set_attributes.call_args_list[0].args[2][4], termios.B9600)
+        self.assertEqual(set_attributes.call_args_list[0].args[2][5], termios.B9600)
+        self.assertEqual(set_attributes.call_args_list[1].args[2][4], termios.B115200)
+        self.assertEqual(set_attributes.call_args_list[1].args[2][5], termios.B115200)
+
     def _version_from(self, response: bytes) -> tuple[str, object]:
         serial = CulSerial(Path("/dev/ttyACM0"), 9_600)
         serial._descriptor = 42

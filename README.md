@@ -191,6 +191,13 @@ mode with a bare `b`. A bare `b` only reports `SMODE`, `TMODE`, `CMODE`, or
 may omit uptime and Wireless M-Bus support; a verified `V` response still
 completes diagnostics and reports unavailable telemetry per field.
 
+Before every exclusive CUL session, the app toggles and restores the logical
+USB CDC line coding. CUL V3's LUFA CDC implementation needs a fresh
+`SET_LINE_CODING` request after a guest-side USB state loss even when the tty
+node remains present; Linux otherwise can reuse its cached setting. This is a
+USB control transfer only: it sends no CUL command, does not reset the radio,
+and does not change the CUL protocol's configured baud rate.
+
 ## Virtual machines and USB re-enumeration
 
 The CUL changes USB identity between `03eb:204b` and `03eb:2ff4`. Your
